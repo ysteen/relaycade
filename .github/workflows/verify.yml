@@ -1,0 +1,56 @@
+name: Netplay Bridge
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install gateway dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Test transport and rollback
+        run: npm test
+
+      - name: Build the gateway container
+        run: docker build --file Dockerfile --tag netplay-bridge:ci .
+
+      - name: Check container startup
+        run: |
+          docker run --detach --name netplay-bridge-ci --read-only --cap-drop ALL --security-opt no-new-privileges --env NETPLAY_BRIDGE_ADMIN_TOKEN=ci-disposable-token-at-least-24-characters netplay-bridge:ci
+          for attempt in {1..20}; do
+            if docker exec netplay-bridge-ci node -e "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs netplay-bridge-ci
+          exit 1
+
+      - name: Remove test container
+        if: always()
+        run: docker rm --force netplay-bridge-ci || true

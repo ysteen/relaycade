@@ -1,0 +1,8 @@
+*
+!package.json
+!package-lock.json
+!server.mjs
+!native.mjs
+!wire.mjs
+!LICENSE
+!NOTICE

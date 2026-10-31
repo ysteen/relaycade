@@ -1,0 +1,13 @@
+The gateway and reusable browser client were extracted from the local RomM
+integration prototype. They retain the GNU Affero General Public License v3
+license provided in LICENSE.
+
+Core source trees and generated binaries are not included in this repository.
+SameBoy, mGBA Splitscreen, Snes9x, and the EmulatorJS/RetroArch frontend retain
+their respective upstream licenses. Build scripts preserve the core license
+alongside generated browser packages and record the pinned source revision.
+
+The diagnostic cartridges under test/fixtures are the original project test
+fixtures. They are used solely to verify linked inputs and battery persistence.
+The GBA fixture build uses linktest helpers from the pinned mGBA Splitscreen
+source tree; those helpers retain the upstream project's license.

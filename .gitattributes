@@ -1,0 +1,5 @@
+*.patch -whitespace
+*.gb binary
+*.gbc binary
+*.gba binary
+*.sfc binary
