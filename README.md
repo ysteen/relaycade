@@ -30,6 +30,9 @@ The container exposes HTTP on loopback port 8082 and native TCP ports 55435–55
 
 ## RomM integration
 
+For installation, WebSocket/TCP proxy setup, web invitations and native RetroArch
+connection commands, see the [RomM connection guide](https://github.com/ysteen/romm/blob/custom/netplay-retroarch-bridge/docs/NETPLAY_BRIDGE.md).
+
 ```mermaid
 flowchart LR
     Web[Browser and WASM core] -->|Login, games, saves| RomM[RomM backend]
