@@ -1,6 +1,6 @@
 # Core qualification artifacts
 
-This catalog covers the first implementation gate: matching local emulation with delayed input correction in SameBoy, mGBA Splitscreen, and Snes9x. The fixtures are original diagnostic cartridges. The native tests use an unmodified Linux RetroArch application; SameBoy and mGBA require the matching custom core. Generated packages remain outside production assets.
+This catalog covers the first implementation gate: matching local emulation with delayed input correction in SameBoy, mGBA Splitscreen, and Snes9x. The fixtures are original diagnostic cartridges. The native tests use an unmodified Linux RetroArch application; SameBoy and mGBA require the matching custom core. Generated packages are installed separately into versioned RomM compatibility asset directories.
 
 ## Source and state profiles
 
@@ -94,6 +94,37 @@ The mGBA SPST4 live native run passed 667 executed web / 724 native frames, 11 d
 
 The stock Snes9x live native run passed 662 executed web / 719 native frames, ten delivered CRC checks, six rollbacks and 18 replayed frames. Both joypads were observed in cartridge SRAM; the run received 92 native pressed-input packets and preserved the shared battery seed, with no recovery request or error. Evidence: `snes-rollback/stock/native-delayed-smoke/result.json`. Its negative control intentionally corrupted CRC frame 120; RetroArch requested state and the session stopped with an explicit compatibility mismatch rather than accepting divergent emulation: `snes-rollback/stock/native-crc-negative-control/result.json`.
 
-## Limits
+## Standalone extraction and RomM adapter verification
 
-These gates qualify the original fixtures and matching Linux/WASM builds. They do not establish compatibility with every commercial title, Android or Windows native builds, all RTC/cartridge peripherals, or waveform-identical audio replay. A running browser AudioContext is an output-path check, not an audible-quality assessment. No production core assets, existing lockstep menus, or deployment settings are changed by these builds and tests.
+The independent repository passed all 49 transport/client tests and its first
+GitHub Actions run, including Docker build and startup:
+[run 41223256063](https://github.com/ysteen/retroarch-netplay-bridge/actions/runs/41223256063).
+The RomM SNES API passed 51 targeted account/permission tests. The installed
+browser room UI passed SameBoy, mGBA, and Snes9x at 603 confirmed frames per peer
+over real WebSockets, including delayed inputs, account save uploads, keyboard,
+gamepad, touch, both themes, and widths from 320 to 3840 pixels. The RomM API was
+mocked in this browser harness; its actual permission checks have separate tests.
+
+Independent-project native extension results:
+
+| Core             | Web / native frames | Delivered CRCs | Rollbacks | SRAM      |
+| ---------------- | ------------------- | -------------- | --------- | --------- |
+| mGBA Splitscreen | 6005 / 6063         | 100            | 66        | Preserved |
+| Snes9x           | 6005 / 6062         | 100            | 66        | Preserved |
+
+The second SameBoy soak also did **not** complete a clean 30-minute run. It
+executed 85,837 web frames with 1,430 delivered CRCs and 952 rollbacks before a
+388,044 ms harness scheduling gap and an `EPIPE`/native connection failure.
+Advancing emulation was observed for about 23 minutes; the 29m49s wall-clock
+duration includes the gap. SRAM remained intact and no CRC mismatch/state request
+was observed. The user requested no further SameBoy testing, and it was not
+restarted. The raw failed `native-gbc-30min-watchdog-fixed/result.json` is preserved
+with a separate `stop-note.json`; this is not recorded as a successful soak.
+
+The RomM SNES adapter currently accepts standard non-interleaved NTSC LoROM/HiROM
+up to 4 MiB with an unambiguous valid header. PAL and extended/interleaved images
+remain outside its qualified timing profile and are rejected before room creation.
+
+## Remaining limits
+
+These gates qualify the original fixtures and matching Linux/WASM builds. They do not establish compatibility with every commercial title, Android or Windows native builds, all RTC/cartridge peripherals, or waveform-identical audio replay. A running browser AudioContext is an output-path check, not an audible-quality assessment. The standalone build scripts do not install assets; the RomM adapter separately selects the qualified packages and room flow.
