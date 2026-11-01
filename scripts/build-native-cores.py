@@ -145,7 +145,9 @@ def build_zlib(work, args, tool, arch, log):
         ],
         log,
     )
-    run(["cmake", "--build", build_dir, "--target", "zlibstatic", "-j2"], log)
+    run(
+        ["cmake", "--build", build_dir, "--target", "zlibstatic", f"-j{args.jobs}"], log
+    )
     return source, build_dir
 
 
@@ -171,10 +173,15 @@ def build(core, target, args):
         if android
         else "-static"
     )
+    link += f" -Wl,--threads={args.jobs}"
     with (work / "build.log").open("a") as log:
         if not source.exists():
             prepare(core, config, source, args, log)
         if core == "mgba_splitscreen":
+            startup_patch = REPO / "patches/mgba-native-startup.patch"
+            wrapper = source / "src/platform/libretro-splitscreen/libretro.c"
+            if "pendingPlayers = playersOpt;" not in wrapper.read_text():
+                run(["patch", "-d", source, "-p1", "--input", startup_patch], log)
             platform_patch = REPO / "patches/mgba-native-platforms.patch"
             if "set(SP_CORE_SRC" not in (source / "CMakeLists.txt").read_text():
                 run(["patch", "-d", source, "-p1", "--input", platform_patch], log)
@@ -227,7 +234,7 @@ def build(core, target, args):
                     work / "build",
                     "--target",
                     "mgba_splitscreen_libretro",
-                    "-j2",
+                    f"-j{args.jobs}",
                 ],
                 log,
             )
@@ -264,7 +271,7 @@ def build(core, target, args):
                         f"LIBS={zlib_build}/libzs.a -lcrypt32",
                     ]
             run(["make", "-C", source / "libretro", *flags, "clean"], log)
-            run(["make", "-C", source / "libretro", "-j2", *flags], log)
+            run(["make", "-C", source / "libretro", f"-j{args.jobs}", *flags], log)
         shutil.copy2(binary, dest / filename)
         run([tool / "bin/llvm-strip", "--strip-unneeded", dest / filename], log)
         run(
@@ -297,6 +304,10 @@ def build(core, target, args):
             patchSha256=digest(REPO / "patches" / config["patch"]),
         )
     if core == "mgba_splitscreen":
+        manifest["startupPatchSha256"] = digest(
+            REPO / "patches/mgba-native-startup.patch"
+        )
+        manifest["nativeStartup"] = "configured-players-v1"
         manifest["platformPatchSha256"] = digest(
             REPO / "patches/mgba-native-platforms.patch"
         )
@@ -306,6 +317,7 @@ def build(core, target, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--jobs", type=int, choices=[1, 2], default=2)
     parser.add_argument("--targets", nargs="+", choices=TARGETS, default=list(TARGETS))
     parser.add_argument("--cores", nargs="+", choices=CORES, default=list(CORES))
     parser.add_argument(

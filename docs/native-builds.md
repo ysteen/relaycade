@@ -13,6 +13,16 @@ reopen it to rebuild the extension list. Select the installed core under
 **Load Core**, then open the ROM under **Load Content**. Installing a DLL alone
 does not register this custom core's GBA extension in the shared content filter.
 
+The native mGBA package applies `patches/mgba-native-startup.patch`: one GBA
+loaded through **Load Content** boots the **Players per ROM** setting directly
+(default: two). Set three or four in **Quick Menu → Core Options**, then reload.
+The GBA Link subsystems remain available for an explicit console count. The
+native build does not wait for the in-core player-count menu, which can block
+RetroArch's initial SRAM exchange when Netplay reloads content. The SPST4 format
+and core compatibility version are unchanged; each manifest records the startup
+patch checksum. These replacement binaries passed static ABI/export checks;
+their interactive RetroArch connection still needs user verification.
+
 | Platform | Builds                              | Verification                                                                                                                                                     |
 | -------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Windows  | x86_64, x86                         | All three DLLs load and report matching versions. mGBA/Snes9x restore and replay correctly, and match Linux state bytes after 120 frames from the same snapshot. |
@@ -28,7 +38,7 @@ every commercial game. SameBoy gameplay was not repeated in this pass.
 
 Build on Linux with Python 3.12+, CMake, make, patch, tar and the existing source
 archives/boot ROMs described in the core build scripts. Compiler parallelism is
-fixed at two. Download and unpack these tools inside the workspace cache:
+limited to two (`--jobs 1` also limits linker threads to one). Download and unpack these tools inside the workspace cache:
 
 - [LLVM-MinGW 20260826 UCRT, Ubuntu 22.04 x86_64](https://github.com/mstorsjo/llvm-mingw/releases/tag/20260826), archive SHA-256 `cee8d2ce3da5145ce4dc882e70d0b0719a783d53a99752c60948fc0659975a65`.
 - [Android NDK r30](https://developer.android.com/ndk/downloads), Linux archive SHA-1 `5107f898313790e449e87eee2183d9a20602dee9`.

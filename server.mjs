@@ -858,11 +858,12 @@ class Room {
     }
     const now = performance.now();
     for (const peer of this.peers.values()) {
-      if (peer.kind === "native" && peer.phase !== "connected") continue;
+      if (peer.kind === "native" && (peer.phase !== "connected" || !peer.ready))
+        continue;
       if (peer.probe) {
         if (now - peer.probe.sent > 6000) peer.ping = null;
         if (now - peer.probe.sent > 15000) {
-          if (peer.kind === "native") peer.close();
+          if (peer.kind === "native") peer.drop("Native heartbeat timed out");
           else peer.ws.terminate();
         }
         continue;

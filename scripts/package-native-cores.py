@@ -158,7 +158,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("romm", type=Path)
     parser.add_argument(
-        "--info-only", action="store_true", help="Install core info without copying binaries"
+        "--info-only",
+        action="store_true",
+        help="Install core info without copying binaries",
     )
     parser.add_argument(
         "--artifacts",
@@ -186,6 +188,12 @@ def main():
             manifest = json.loads((source / "manifest.json").read_text())
             assert manifest["target"] == target
             assert manifest["version"] == catalog[core]["native"]["coreVersion"]
+            if core == "mgba_splitscreen":
+                startup_patch = CORE_INFO.parent / "patches/mgba-native-startup.patch"
+                assert (
+                    manifest.get("startupPatchSha256")
+                    == hashlib.sha256(startup_patch.read_bytes()).hexdigest()
+                )
             filename = f"{core}_libretro." + (
                 "so" if target.startswith("android-") else "dll"
             )
@@ -196,10 +204,17 @@ def main():
         destination = (
             args.romm / "custom-emulatorjs/data/cores/compat/rollback" / folder
         )
+        if core == "mgba_splitscreen":
+            shutil.copy2(
+                CORE_INFO.parent / "patches/mgba-native-startup.patch", destination
+            )
         downloads = {
             "linux-x86_64": {
                 "label": "Linux x86_64",
                 "path": catalog[core]["native"]["nativeDownload"],
+                "sha256": hashlib.sha256(
+                    (destination / f"{core}_libretro.so").read_bytes()
+                ).hexdigest(),
             }
         }
         for target, (label, _) in TARGETS.items():

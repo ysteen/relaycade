@@ -10,6 +10,7 @@ COMPAT_EMSDK="${COMPAT_EMSDK:-$TASK_ROOT/build/emsdk}"
 COMPAT_ARCHIVE="${COMPAT_ARCHIVE:-$TASK_ROOT/result/netplay-interop/stock-core/downloads/mgba-splitscreen-f1d5975.tar.gz}"
 COMPAT_FRONTEND="${COMPAT_FRONTEND:-$TASK_ROOT/build/compile/retroarch-netplay}"
 COMPAT_PATCH="$COMPAT_REPO/patches/mgba-rollback-state.patch"
+COMPAT_STARTUP_PATCH="$COMPAT_REPO/patches/mgba-native-startup.patch"
 COMPAT_PROBE="$COMPAT_REPO/test/mgba-core-probe.c"
 if [[ -e "$COMPAT_WORK" ]]; then
   printf 'Refusing to reuse existing work directory: %s\n' "$COMPAT_WORK" >&2
@@ -22,6 +23,7 @@ for kind in native wasm; do
   tar -xzf "$COMPAT_ARCHIVE" --strip-components=1 -C "$COMPAT_WORK/$kind-source"
   patch -d "$COMPAT_WORK/$kind-source" -p1 --input "$COMPAT_PATCH"
 done
+patch -d "$COMPAT_WORK/native-source" -p1 --input "$COMPAT_STARTUP_PATCH"
 python3 - "$COMPAT_WORK/wasm-source/CMakeLists.txt" <<'PY'
 from pathlib import Path
 import sys
@@ -91,15 +93,17 @@ PY
     7z a -t7z -mx=7 mgba_splitscreen-wasm.data mgba_link_libretro.js mgba_link_libretro.wasm core.json build.json license.txt
   )
 fi
-python3 - "$COMPAT_WORK" "$COMPAT_PATCH" <<'PY'
+python3 - "$COMPAT_WORK" "$COMPAT_PATCH" "$COMPAT_STARTUP_PATCH" <<'PY'
 from pathlib import Path
 import hashlib, json, sys
-root, patch = map(Path, sys.argv[1:])
+root, patch, startup_patch = map(Path, sys.argv[1:])
 paths = ['native/mgba_splitscreen_libretro.so', 'native-probe.so', 'wasm/mgba_splitscreen_libretro.a', 'core-probe.mjs', 'core-probe.wasm']
 paths += [str(p.relative_to(root)) for p in (root / 'web').glob('*')] if (root / 'web').exists() else []
 manifest = {'core': 'mGBA Splitscreen', 'version': '0.1.0-f1d5975-rollback1', 'stateProfile': 'SPST4',
             'sourceRevision': 'f1d5975d77285f77affbfe64b7050ebd5c4b6a77',
             'patchSha256': hashlib.sha256(patch.read_bytes()).hexdigest(),
+            'startupPatchSha256': hashlib.sha256(startup_patch.read_bytes()).hexdigest(),
+            'nativeStartup': 'configured-players-v1',
             'sha256': {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths}}
 (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 PY

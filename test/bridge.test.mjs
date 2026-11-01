@@ -302,6 +302,24 @@ test("native clients wait for the browser's initial state and SRAM", async (t) =
   const desktop = await pending;
   assert.equal(stored.peers.get(1).phase, "connected");
   assert.deepEqual(desktop.sync.payload.subarray(-battery.length), battery);
+  const peer = stored.peers.get(1);
+  peer.probe = { sent: performance.now() - 16000 };
+  stored.probePeers();
+  assert.equal(
+    peer.socket.destroyed,
+    false,
+    "Handshake uses its own deadline before PLAY",
+  );
+  peer.probe = null;
+  stored.probePeers();
+  assert.equal(
+    peer.probe,
+    null,
+    "Do not send heartbeat probes before native readiness",
+  );
+  peer.ready = true;
+  stored.probePeers();
+  assert.equal((await desktop.queue.next()).command, CMD.PING);
 });
 
 test("CRC32 and protocol-7 core-state blocks follow native byte order", () => {
