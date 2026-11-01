@@ -1,6 +1,6 @@
 # Netplay bridge protocol 1
 
-The bridge runs separately from RomM. It does not execute a core. The browser with wire player ID 0 supplies the authoritative state. Every participant runs the complete emulation locally: linked handhelds for GB/GBA, or one console with two joypads for SNES. Wire player IDs stay fixed; the waiting room can assign different emulated controller or console numbers.
+The bridge runs separately from RomM. It does not execute a core. The elected browser host supplies the authoritative state. Every participant runs the complete emulation locally: linked handhelds for GB/GBA, or one console with two joypads for SNES. Wire player IDs stay fixed within a connection; the waiting room can assign different emulated controller or console numbers. The first browser receives wire ID 0. Host authority can transfer independently of wire IDs.
 
 ## Administration
 
@@ -16,7 +16,7 @@ RomM supplies public hostnames. Browser paths are relative to the public bridge 
 
 ## Browser connection
 
-Connect to `hostPath` or `peerPath` with WebSocket. The bridge sends `{t:"joined", player, players}`. Slot 0 is the host. JSON messages are text frames. State and battery data are each one binary frame immediately following their JSON header.
+Connect to `hostPath` or `peerPath` with WebSocket. The bridge sends `{t:"joined", player, players}`. Slot 0 is the initial host. JSON messages are text frames. State and battery data are each one binary frame immediately following their JSON header.
 
 1. Host sends `{t:"state", f:0, size, sram:"<base64 memory ID 0>"}`, followed by the raw `retro_serialize` bytes.
 2. Bridge replies `{t:"state-ready", revision, f}` to the host. Host sends `{t:"ready", revision}`.
@@ -26,14 +26,17 @@ Connect to `hostPath` or `peerPath` with WebSocket. The bridge sends `{t:"joined
 
 ### Waiting room
 
-With `manualStart: true`, the joined message also contains `manualStart: true`. The host sends its initial state for native handshakes, but guest battery exchange and the start barrier wait for the host's start request. Waiting rooms expire after 30 minutes if they never start.
+With `manualStart: true`, the joined message also contains `{manualStart:true, host, generation, running}`. The host sends its initial state for native handshakes, but guest battery exchange and the start barrier wait for the host's start request. Waiting rooms expire after 30 minutes if they never start. Browser messages include the current `generation`; packets from an older game are consumed and ignored.
 
-- The bridge broadcasts `{t:"lobby", players, seats, starting, canStart, members}`. `seats[wirePlayer]` is a zero-based emulated controller/console number or `null`. Every seat is initially `null`. Members contain `{player, nickname, kind, ready}`.
-- A browser sends `{t:"assign", player, seat}` to select or clear a number. Guests may change only their own assignment; wire player 0 may change any connected member. Occupied numbers cannot be reassigned until cleared.
-- Only wire player 0 may send `{t:"start-request"}`. All slots must be connected and ready, and every number must be assigned exactly once. Rejected lobby actions return `{t:"action-error", message}` without closing the room.
-- The bridge freezes assignments and broadcasts `{t:"prepare", seats}`. The host restores its initial state and imports its battery into its assigned console. Guests then send their batteries; the host imports each into its assigned console. SNES always uses the host's shared memory ID 0. The normal latest-state barrier above then starts play.
+- The bridge broadcasts `{t:"lobby", players, seats, host, running, starting, canStart, members}`. `seats[wirePlayer]` is a zero-based emulated controller/console number or `null`. Every arriving member starts unassigned. Members contain `{player, nickname, kind, ready, playing, ping}`.
+- A browser sends `{t:"assign", player, seat}` to select or clear a number. Guests may change only their own assignment; the elected host may change any waiting member. Occupied numbers cannot be reassigned until cleared. Active players keep their existing numbers while a game is running.
+- Only the elected host may send `{t:"start-request"}`. The first start requires every slot to connect. Later starts require a waiting participant and every connected member to choose an available number. Rejected lobby actions return `{t:"action-error", message}` without closing the room.
+- The bridge freezes assignments and broadcasts `{t:"prepare", seats, host, generation, restarting}` with an increased generation. Clients export battery data from the last confirmed state, reset to the initial core snapshot, and import those batteries into the assigned consoles. New guests supply their own selected save. SNES retains the current host's shared memory ID 0 and guests send empty batteries. The normal latest-state barrier above then starts play at frame zero.
 - Input messages retain wire player IDs. Browser clients route inputs to the assigned emulated devices, and native MODE messages carry the matching controller masks. Choosing P2 does not transfer host authority.
-- A guest leaving before preparation frees their number and slot. Departure during preparation or play, or any host departure, closes the room. A waiting native client has no handshake timeout after completing PLAY; the room's setup deadline still applies.
+- Departure frees the member's number and slot. Remaining players keep running with sequential neutral inputs for that wire ID. The last departure removes the room. Host departure transfers controls and ownership to another active browser, or a waiting browser if no active browser remains. Native-only games continue; a browser must rejoin to control the next restart.
+- New members may join a running room, choose a free number, and wait. Existing players continue until the host explicitly restarts. If only native players remained, the bridge requests a current native snapshot and sends `{t:"restart-source", size}` plus bytes to the new browser host to preserve their battery progress.
+- Heartbeats run every two seconds. Browsers echo `{t:"ping", nonce}` as `{t:"pong", nonce}`; native clients use RetroArch PING/PONG. `{t:"latency", members:[{player,ping}]}` reports smoothed round-trip milliseconds to the relay, not peer-to-peer or emulation latency. Unmeasured or stale values are `null`. A peer silent for 15 seconds is removed individually.
+- A waiting native client has no handshake timeout after completing PLAY; the room's setup deadline still applies.
 
 When `manualStart` is false, wire IDs map directly to emulated numbers and the existing automatic start behavior remains available.
 
@@ -86,14 +89,15 @@ accepted checkpoint. Identical duplicates are allowed; conflicting duplicates
 fail. This bounds retained checkpoint history even when peers arrive unevenly.
 Native clients validate host CRCs using RetroArch and request state on mismatch.
 A repeated native resync loop is treated as incompatibility, not successful
-synchronization. Guest disconnects close a running room. Reset, spectators, late
-joining and host migration are not supported by protocol 1.
+synchronization. Legacy automatic-start rooms close on departure. Manual rooms
+support the departure and restart flow above. Spectators and seamless mid-game
+joining without a reset are not supported.
 
 ## Native clients
 
 Only rooms explicitly marked `nativeAllowed` open a TCP listener. Connect ordinary RetroArch to the published hostname and `tcpPort`, using the room password and matching core/content/options. RetroArch wire protocols 5 to 7 are supported. Each peer gets one digital joypad and an available slot. Lockstep rooms use RetroArch's existing slave mode: the host samples their latest input for each frame and echoes the assigned input back. Rollback rooms use ordinary playing mode and preserve the native input frame numbers. The bridge advertises the browser's WASM32 little-endian platform layout, so platform-dependent cores can reject incompatible sessions. Core compatibility must be established separately from transport compatibility.
 
-The native start barrier includes a neutral initialization frame. Native wire frame numbers are browser frame numbers plus one. Native input frame 1 acknowledges completion of the bootstrap before the host state and browser start event are sent. This transport barrier does not prove stock core serialization completeness; the compatibility limitations in [README.md](README.md) apply. Native state recovery reloads native peers only. A pre-start native connection error emits `{t:"peer-error", player, message}` and departure emits `{t:"peer-left", player, message}` so a browser can wait for a replacement guest.
+The initial native start barrier includes a neutral initialization frame. Native wire frame numbers initially equal browser frame numbers plus one. Native input frame 1 acknowledges completion of the bootstrap before the host state and browser start event are sent. On a room restart, a bounded STALL/PING barrier drains old input, NOINPUT advances the server clock if needed, and LOAD_STATE/STALL restarts the existing TCP connection with a new frame offset. This transport barrier does not prove stock core serialization completeness; the compatibility limitations in [README.md](README.md) apply. Native state recovery reloads native peers only. A native connection error emits `{t:"peer-error", player, message}` and departure emits `{t:"peer-left", player, message}` so a browser can keep playing or wait for a replacement guest.
 
 ### Qualified SameBoy startup calibration
 

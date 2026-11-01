@@ -34,7 +34,7 @@ function fixture(
   const inputs = [];
   const events = [];
   const room = {
-    manifest: { maxPrediction, stateSize: 128, manualStart },
+    manifest: { maxPrediction, stateSize: 128, manualStart, players: 2 },
     seats,
     lobby() {},
     password: "",
@@ -168,4 +168,49 @@ test("lockstep default retains native slave sampling and bootstrap echoes", (t) 
   peer.command(CMD.INPUT, words(9, 1, 32));
   assert.equal(peer.buttons, 32);
   assert.deepEqual(inputs, []);
+});
+
+test("restart drains old native input before rebasing the existing connection", (t) => {
+  const { peer, room, socket, inputs } = fixture(t, { manualStart: true });
+  peer.command(CMD.INPUT, words(0, 1, 0));
+  peer.command(CMD.INPUT, words(1, 1, 8));
+  peer.sendInput(0, 0, 0);
+  room.running = false;
+  peer.probe = { sent: performance.now() };
+  let ready = 0;
+  room.maybeStart = () => {
+    ready++;
+  };
+  peer.prepareRestart();
+  peer.command(CMD.INPUT, words(5, 1, 32));
+  assert.equal(inputs.length, 1);
+  peer.command(CMD.PONG, Buffer.alloc(0));
+  assert.equal(ready, 0);
+  peer.command(CMD.PONG, Buffer.alloc(0));
+  assert.equal(ready, 1);
+  assert(peer.restartReady);
+  const before = socket.packets.length;
+  room.running = true;
+  peer.finishStart();
+  peer.flushInputs();
+  const restart = socket.packets.slice(before);
+  assert.deepEqual(
+    restart
+      .filter((packet) => packet.command === CMD.NOINPUT)
+      .map((packet) => packet.data.readUInt32BE(0)),
+    [2, 3, 4, 5],
+  );
+  assert.equal(
+    restart
+      .find((packet) => packet.command === CMD.LOAD_STATE)
+      .data.readUInt32BE(0),
+    6,
+  );
+  assert.equal(restart.at(-1).command, CMD.STALL);
+  assert.equal(peer.frameOffset, 6);
+  peer.command(CMD.INPUT, words(5, 1, 128));
+  assert.equal(inputs.length, 1);
+  peer.command(CMD.INPUT, words(6, 1, 64));
+  assert.deepEqual(inputs.at(-1), { frame: 0, player: 1, buttons: 64 });
+  assert(!socket.destroyed);
 });

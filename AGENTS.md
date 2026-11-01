@@ -8,3 +8,4 @@
 - Use RomM's persistent `scripts/headless-browser.mjs` helper for the optional browser integration harness (`ROMM_SOURCE`).
 - Keep source comments and documentation in English. Preserve upstream notices and core source revisions when distributing builds.
 - Changes to vendored browser modules must be synchronized through `scripts/sync-romm-client.mjs` and verified with `--check`.
+- Do not run native emulator qualification under WSL. The rejoin harness coincided with repeated RAM/swap exhaustion on 2026-11-02. Use a separate Linux runner with a hard cgroup memory limit and at most two CPUs. Keep local transport tests serial and image builds in CI until native rejoin memory growth is diagnosed.

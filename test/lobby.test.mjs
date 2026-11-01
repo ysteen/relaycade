@@ -64,6 +64,7 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
     const actions = [],
       errors = [];
     let lobby;
+    let latency;
     const client = new BridgeConnection(core, socket, {
       player,
       players: 3,
@@ -72,6 +73,9 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
         lobby = value;
       },
       onActionError: (error) => actions.push(error),
+      onLatency: (value) => {
+        latency = value;
+      },
       onError: (error) => errors.push(error.message),
     });
     clients.push(client);
@@ -83,6 +87,9 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
       get lobby() {
         return lobby;
       },
+      get latency() {
+        return latency;
+      },
     };
   }
   const room = await api("", {
@@ -93,11 +100,16 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
     stateSize: 64,
     players: 3,
     manualStart: true,
+    owner: "host",
     password: "",
   });
   const host = connect(room.hostPath, 0, 11);
   await until(() => host.lobby);
-  const guest = connect((await api(`/${room.id}/join`, {})).peerPath, 1, 22);
+  const guest = connect(
+    (await api(`/${room.id}/join`, { owner: "guest" })).peerPath,
+    1,
+    22,
+  );
   let third = connect((await api(`/${room.id}/join`, {})).peerPath, 2, 33);
   await until(() => host.lobby.members.length === 3 && third.lobby);
   assert.deepEqual(host.lobby.seats, [null, null, null]);
@@ -152,4 +164,82 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
   const state = new DataView(host.core.data.buffer);
   assert.equal(state.getUint32(8), 2 * state.getUint32(16));
   assert.equal(state.getUint32(12), 4 * state.getUint32(16));
+
+  const serverRoom = bridge.rooms.get(room.id);
+  serverRoom.probePeers();
+  await until(() =>
+    host.latency?.every((member) => Number.isFinite(member.ping)),
+  );
+  assert.equal(host.latency.length, 3);
+
+  async function advance(group, frame) {
+    for (
+      let i = 0;
+      i < 1000 && group.some(({ client }) => client.session.frame < frame);
+      i++
+    ) {
+      group.forEach(({ client }, index) => {
+        if (client.session.frame < frame) client.tick(1 << index);
+      });
+      await delay(1);
+    }
+    await until(() =>
+      group.every(({ client }) => client.session.confirmed === frame),
+    );
+    assert(group.every(({ client }) => !client.closed));
+    assert(
+      group.every(({ core }) =>
+        Buffer.from(core.save()).equals(Buffer.from(group[0].core.save())),
+      ),
+    );
+  }
+
+  third.client.stop();
+  await until(() => host.lobby.members.length === 2);
+  await advance([host, guest], 90);
+  const beforeJoin = host.client.session.frame;
+  third = connect((await api(`/${room.id}/join`, {})).peerPath, 2, 44);
+  await until(() => third.lobby?.members.length === 3);
+  assert.equal(third.client.started, false);
+  assert.equal(third.lobby.seats[2], null);
+  await advance([host, guest], 120);
+  assert(host.client.session.frame > beforeJoin);
+  third.client.assignPlayer(2, 1);
+  await until(() => host.lobby.canStart);
+  for (const { core } of [host, guest]) {
+    core.data[0] = 77;
+    core.data[2] = 88;
+  }
+  host.client.startGame();
+  await until(() =>
+    [host, guest, third].every(
+      ({ client }) => client.started && client.generation === 2,
+    ),
+  );
+  for (const { core } of [host, guest, third])
+    assert.deepEqual([...core.data.subarray(0, 3)], [77, 44, 88]);
+  await advance([host, guest, third], 30);
+
+  host.client.stop();
+  await until(() => guest.lobby.host === 1 && guest.lobby.members.length === 2);
+  assert.equal(serverRoom.metadata().owner, "guest");
+  await advance([guest, third], 90);
+  const joined = await api(`/${room.id}/join`, {});
+  assert.equal(joined.player, 0);
+  const replacement = connect(joined.peerPath, 0, 55);
+  await until(() => replacement.lobby?.members.length === 3);
+  replacement.client.assignPlayer(0, 2);
+  await until(() => guest.lobby.canStart);
+  guest.client.startGame();
+  await until(() =>
+    [guest, third, replacement].every(
+      ({ client }) => client.started && client.generation === 3,
+    ),
+  );
+  await advance([guest, third, replacement], 70);
+  assert(
+    [guest, third, replacement].every(({ errors }) => errors.length === 0),
+  );
+  clients.forEach((client) => client.stop());
+  await until(() => !bridge.rooms.has(room.id));
 });

@@ -63,7 +63,7 @@ node scripts/sync-romm-client.mjs ../romm-retroarch-sync
 node scripts/sync-romm-client.mjs ../romm-retroarch-sync --check
 ```
 
-See [PROTOCOL.md](PROTOCOL.md) for the backend and WebSocket contracts. The current native password is shared by a room; per-account native credentials, late joining, and host migration remain future protocol work.
+See [PROTOCOL.md](PROTOCOL.md) for the backend and WebSocket contracts. RomM waiting rooms keep playing when someone leaves, transfer host controls to another browser, and admit replacements for a host-confirmed restart. The room panel shows each participant's round-trip latency to the relay beside their name. The current native password is shared by a room; per-account native credentials remain future protocol work.
 
 ## Verify and build cores
 

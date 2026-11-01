@@ -37,11 +37,11 @@ jobs:
         run: npm test
 
       - name: Build the gateway container
-        run: docker build --file Dockerfile --tag netplay-bridge:ci .
+        run: docker build --file Dockerfile --label "org.opencontainers.image.revision=$GITHUB_SHA" --tag netplay-bridge:ci --tag "netplay-bridge:sha-$GITHUB_SHA" .
 
       - name: Check container startup
         run: |
-          docker run --detach --name netplay-bridge-ci --read-only --cap-drop ALL --security-opt no-new-privileges --env NETPLAY_BRIDGE_ADMIN_TOKEN=ci-disposable-token-at-least-24-characters netplay-bridge:ci
+          docker run --detach --name netplay-bridge-ci --memory 256m --memory-swap 256m --cpus 2 --read-only --cap-drop ALL --security-opt no-new-privileges --env NETPLAY_BRIDGE_ADMIN_TOKEN=ci-disposable-token-at-least-24-characters netplay-bridge:ci
           for attempt in {1..20}; do
             if docker exec netplay-bridge-ci node -e "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
               exit 0
@@ -50,6 +50,19 @@ jobs:
           done
           docker logs netplay-bridge-ci
           exit 1
+
+      - name: Package the gateway image
+        if: github.event_name != 'pull_request'
+        run: docker save "netplay-bridge:sha-$GITHUB_SHA" | gzip -1 > "$RUNNER_TEMP/netplay-bridge-image.tar.gz"
+
+      - name: Upload the gateway image
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: netplay-bridge-image
+          path: ${{ runner.temp }}/netplay-bridge-image.tar.gz
+          compression-level: 0
+          retention-days: 7
 
       - name: Remove test container
         if: always()

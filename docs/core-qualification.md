@@ -2,6 +2,8 @@
 
 This catalog covers the first implementation gate: matching local emulation with delayed input correction in SameBoy, mGBA Splitscreen, and Snes9x. The fixtures are original diagnostic cartridges. The native tests use an unmodified Linux RetroArch application; SameBoy and mGBA require the matching custom core. Generated packages are installed separately into versioned RomM compatibility asset directories.
 
+Native rejoin qualification is currently incomplete. The new `test/native-rejoin-smoke.mjs` run coincided with repeated WSL memory exhaustion on 2026-11-02: approximately 7.4 GiB of RAM and 2 GiB of swap were exhausted, followed by Hyper-V socket allocation failures. The retained kernel logs do not identify the individual allocating process. Do not repeat that workload under WSL. The harness now refuses WSL and requires a separate Linux cgroup capped at 2 GiB and two CPUs before loading any emulator. Earlier native startup/rollback results below do not qualify native rejoin. Browser mGBA/Snes9x leave, rejoin, restart and host transfer passed separately; the transport suite also covers the native restart wire exchange.
+
 ## Source and state profiles
 
 | Core             | Pinned source                              | Native library version    | State profile / bytes                                         |

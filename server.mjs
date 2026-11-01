@@ -140,6 +140,16 @@ class Room {
     this.crcs = new Map();
     this.latestCheckpoint = 0;
     this.resyncs = [];
+    this.host = 0;
+    this.generation = 0;
+    this.vacant = new Map();
+    this.paused = false;
+    if (manifest.manualStart) {
+      this.heartbeat = setInterval(() => this.probePeers(), 2000);
+      this.heartbeat.unref();
+      this.nativeClock = setInterval(() => this.tickNativeClock(), 8);
+      this.nativeClock.unref();
+    }
     this.timer = setTimeout(
       () => this.close("Room setup timed out"),
       (manifest.manualStart ? 30 : 5) * 60000,
@@ -199,9 +209,14 @@ class Room {
     }
   }
 
-  available() {
+  available(native = false) {
     this.expireReservations();
-    for (let slot = 1; slot < this.manifest.players; slot++)
+    for (
+      let slot =
+        !native && this.manifest.manualStart && !this.peers.has(0) ? 0 : 1;
+      slot < this.manifest.players;
+      slot++
+    )
       if (!this.peers.has(slot) && !this.reservations.has(slot)) return slot;
     return -1;
   }
@@ -209,10 +224,11 @@ class Room {
   canStart() {
     return (
       !!this.state &&
-      !this.started &&
+      (!this.started ||
+        [...this.peers.values()].some((peer) => !peer.playing)) &&
       !this.starting &&
-      this.peers.size === this.manifest.players &&
-      this.seats.every((seat) => seat !== null) &&
+      (this.hadGame || this.peers.size === this.manifest.players) &&
+      [...this.peers.keys()].every((player) => this.seats[player] !== null) &&
       [...this.peers.values()].every(
         (peer) => peer.kind === "web" || peer.ready,
       )
@@ -225,13 +241,17 @@ class Room {
       t: "lobby",
       players: this.manifest.players,
       seats: this.seats,
-      starting: this.starting || this.started,
+      host: this.host,
+      running: !!this.running,
+      starting: this.starting,
       canStart: this.canStart(),
       members: [...this.peers.values()].map((peer) => ({
         player: peer.player,
         nickname: peer.nickname,
         kind: peer.kind,
         ready: peer.kind === "web" || peer.ready,
+        playing: !!peer.playing,
+        ping: peer.ping ?? null,
       })),
     });
   }
@@ -240,10 +260,9 @@ class Room {
     const reject = (message) => jsonPeer(peer, { t: "action-error", message });
     if (!this.manifest.manualStart)
       return reject("This room does not have a lobby");
-    if (this.started || this.starting)
-      return reject("The game is already starting or running");
+    if (this.starting) return reject("The game is already starting");
     if (data.t === "assign") {
-      if (peer.player !== 0 && data.player !== peer.player)
+      if (peer.player !== this.host && data.player !== peer.player)
         return reject("You can only change your own player number");
       if (
         !Number.isInteger(data.player) ||
@@ -254,6 +273,8 @@ class Room {
             data.seat >= this.manifest.players))
       )
         return reject("Choose a connected player and a valid player number");
+      if (this.running && this.peers.get(data.player).playing)
+        return reject("Player numbers are fixed until the next game");
       const other = this.seats.indexOf(data.seat);
       if (data.seat !== null && other !== -1 && other !== data.player)
         return reject("That player number is already selected");
@@ -261,22 +282,77 @@ class Room {
       this.lobby();
       return;
     }
-    if (peer.player !== 0) return reject("Only the host can start the game");
+    if (peer.player !== this.host)
+      return reject("Only the host can start the game");
     if (!this.canStart())
       return reject(
         "Wait for every player to connect and choose a player number",
       );
     this.starting = true;
+    if (this.running && !peer.playing) {
+      const source = [...this.peers.values()].find(
+        (other) => other.kind === "native" && other.playing,
+      );
+      if (source) {
+        source.requestRestartSource();
+        this.lobby();
+        return;
+      }
+    }
+    this.prepareGame();
+  }
+
+  prepareGame(source) {
+    const restarting = this.started;
+    const used = new Set(this.seats.filter((seat) => seat !== null));
+    for (let player = 0; player < this.manifest.players; player++) {
+      if (this.seats[player] !== null) continue;
+      const seat = Array.from(
+        { length: this.manifest.players },
+        (_, index) => index,
+      ).find((value) => !used.has(value));
+      this.seats[player] = seat;
+      used.add(seat);
+    }
+    this.generation++;
+    this.started = false;
+    this.running = false;
+    this.paused = false;
+    this.requestedFrame = undefined;
+    this.heldInputs.length = 0;
+    this.pendingBatteries.clear();
+    this.crcs.clear();
+    this.latestCheckpoint = 0;
+    this.resyncs.length = 0;
+    this.progress = this.confirmed = this.nextHostFrame = 0;
+    this.vacant = new Map(
+      Array.from({ length: this.manifest.players }, (_, player) => player)
+        .filter((player) => !this.peers.has(player))
+        .map((player) => [player, 0]),
+    );
+    if (source) {
+      const host = this.peers.get(this.host);
+      jsonPeer(host, { t: "restart-source", size: source.length });
+      binaryPeer(host, source);
+    }
     for (const other of this.peers.values()) {
+      other.nextFrame = other.frame = other.confirmed = 0;
+      other.lastCheckpoint = 0;
       if (other.kind === "web") {
         other.ready = -1;
-        other.battery = other.player === 0;
-        if (other.player) this.pendingBatteries.add(other.player);
-      }
+        other.battery = other.player === this.host;
+        if (other.player !== this.host) this.pendingBatteries.add(other.player);
+      } else if (other.playing) other.prepareRestart();
     }
     this.lobby();
     for (const other of this.peers.values())
-      jsonPeer(other, { t: "prepare", seats: this.seats });
+      jsonPeer(other, {
+        t: "prepare",
+        seats: this.seats,
+        host: this.host,
+        generation: this.generation,
+        restarting,
+      });
   }
 
   attach(ws, slot, reservation) {
@@ -293,13 +369,25 @@ class Room {
       transfer: null,
       frame: 0,
       confirmed: 0,
+      playing: false,
     };
     this.peers.set(slot, peer);
+    if (this.manifest.manualStart) {
+      this.seats[slot] = null;
+      this.electHost();
+    }
     jsonPeer(peer, {
       t: "joined",
       player: slot,
       players: this.manifest.players,
-      ...(this.manifest.manualStart ? { manualStart: true } : {}),
+      ...(this.manifest.manualStart
+        ? {
+            manualStart: true,
+            host: this.host,
+            generation: this.generation,
+            running: !!this.running,
+          }
+        : {}),
     });
     ws.on("message", (bytes, binary) => {
       try {
@@ -324,6 +412,21 @@ class Room {
   message(peer, data) {
     if (!data || typeof data !== "object" || Array.isArray(data))
       throw new Error("Invalid web message");
+    if (data.t === "pong") {
+      this.pong(peer, data.nonce);
+      return;
+    }
+    if (
+      this.manifest.manualStart &&
+      (data.generation ?? 0) !== this.generation
+    ) {
+      if ((data.generation ?? 0) < this.generation) {
+        if (data.t === "state" || data.t === "battery")
+          peer.transfer = { ...data, discard: true };
+        return;
+      }
+      throw new Error("Invalid room generation");
+    }
     switch (data.t) {
       case "assign":
       case "start-request":
@@ -331,7 +434,7 @@ class Room {
         return;
       case "state":
         if (
-          peer.player !== 0 ||
+          peer.player !== this.host ||
           !uint(data.f) ||
           data.size !== this.manifest.stateSize
         )
@@ -356,7 +459,7 @@ class Room {
         return;
       case "battery":
         if (
-          !peer.player ||
+          peer.player === this.host ||
           this.started ||
           (this.manifest.manualStart && !this.starting) ||
           peer.battery ||
@@ -384,7 +487,7 @@ class Room {
           (other) => other.kind === "native",
         );
         if (
-          peer.player !== 0 ||
+          peer.player !== this.host ||
           !this.started ||
           this.running ||
           !native?.calibration ||
@@ -397,9 +500,11 @@ class Room {
         return;
       }
       case "input":
+        if (this.manifest.manualStart && !peer.playing) return;
         this.input(peer, data.f, data.b);
         return;
       case "progress":
+        if (this.manifest.manualStart && !peer.playing) return;
         if (
           !this.running ||
           !uint(data.f) ||
@@ -409,7 +514,9 @@ class Room {
           (this.manifest.maxPrediction > 0 &&
             (data.f - data.confirmed > this.manifest.maxPrediction ||
               [...this.peers.values()].some(
-                (other) => data.confirmed > other.nextFrame,
+                (other) =>
+                  (!this.manifest.manualStart || other.playing) &&
+                  data.confirmed > other.nextFrame,
               ))) ||
           data.f < peer.frame ||
           data.f > peer.nextFrame + 30
@@ -417,15 +524,17 @@ class Room {
           throw new Error("Invalid frame progress");
         peer.frame = data.f;
         peer.confirmed = data.confirmed;
-        if (peer.player === 0) {
+        if (peer.player === this.host) {
           this.progress = data.f;
           this.confirmed = data.confirmed;
         }
         return;
       case "crc":
+        if (this.manifest.manualStart && !peer.playing) return;
         this.checksum(peer, data);
         return;
       case "pause":
+        if (this.manifest.manualStart && !peer.playing) return;
         if (typeof data.paused !== "boolean") throw new Error("Invalid pause");
         this.pause(peer, data.paused);
         return;
@@ -439,8 +548,14 @@ class Room {
     peer.transfer = null;
     if (!transfer || bytes.length !== transfer.size)
       throw new Error("Invalid binary transfer size");
+    if (
+      transfer.discard ||
+      (this.manifest.manualStart &&
+        (transfer.generation ?? 0) !== this.generation)
+    )
+      return;
     if (transfer.t === "battery") {
-      const host = this.peers.get(0);
+      const host = this.peers.get(this.host);
       if (!host) throw new Error("Host is not connected");
       peer.battery = true;
       this.pendingBatteries.add(peer.player);
@@ -494,7 +609,7 @@ class Room {
   }
 
   sendCalibration(peer, stage, state) {
-    const host = this.peers.get(0);
+    const host = this.peers.get(this.host);
     jsonPeer(host, {
       t: "native-calibration",
       player: peer.player,
@@ -511,18 +626,19 @@ class Room {
       (this.manifest.manualStart && !this.starting) ||
       !this.state ||
       this.pendingBatteries.size ||
-      this.peers.size !== this.manifest.players
+      (!this.hadGame && this.peers.size !== this.manifest.players)
     )
       return;
     for (const peer of this.peers.values()) {
       if (
         peer.kind === "native"
-          ? !peer.ready
+          ? !peer.ready || (peer.restarting && !peer.restartReady)
           : !peer.battery || peer.ready !== this.revision
       )
         return;
     }
     this.started = true;
+    this.hadGame = true;
     clearTimeout(this.timer);
     for (const peer of this.peers.values())
       if (peer.kind === "native") peer.start();
@@ -538,6 +654,9 @@ class Room {
       )
         return;
     this.running = true;
+    this.starting = false;
+    this.nativeClockAt = performance.now();
+    for (const peer of this.peers.values()) peer.playing = true;
     for (const peer of this.peers.values())
       if (peer.kind === "native") peer.finishStart();
     for (const peer of this.peers.values())
@@ -547,9 +666,11 @@ class Room {
         player: peer.player,
         players: this.manifest.players,
         maxPrediction: this.manifest.maxPrediction,
+        ...(this.manifest.manualStart ? { generation: this.generation } : {}),
       });
     for (const peer of this.peers.values())
       if (peer.kind === "native") peer.flushInputs?.();
+    this.lobby();
   }
 
   input(peer, frame, buttons) {
@@ -564,7 +685,16 @@ class Room {
     if (frame > this.progress + 120)
       throw new Error("Input exceeds host frame window");
     peer.nextFrame++;
-    if (peer.player === 0) {
+    if (
+      this.manifest.manualStart &&
+      ![...this.peers.values()].some(
+        (other) => other.kind === "web" && other.playing,
+      )
+    ) {
+      this.progress = Math.max(this.progress, frame);
+      this.confirmed = Math.max(this.confirmed, frame);
+    }
+    if (peer.player === this.host) {
       for (const other of this.peers.values())
         if (other.kind === "native" && other.slave)
           this.input(other, frame, other.buttons);
@@ -576,10 +706,12 @@ class Room {
       return;
     }
     this.relayInput(peer, frame, buttons);
+    this.fillVacancies();
   }
 
   relayInput(peer, frame, buttons) {
     for (const other of this.peers.values()) {
+      if (this.manifest.manualStart && !other.playing) continue;
       if (other === peer && !peer.slave) continue;
       if (other.kind === "native") other.sendInput(frame, peer.player, buttons);
       else
@@ -588,6 +720,7 @@ class Room {
           f: frame,
           b: buttons,
           player: peer.player,
+          ...(this.manifest.manualStart ? { generation: this.generation } : {}),
         });
     }
     if (peer.player === 0) this.nextHostFrame = frame + 1;
@@ -611,12 +744,12 @@ class Room {
     this.crcs.set(data.f, checks);
     peer.lastCheckpoint = data.f;
     this.latestCheckpoint = Math.max(this.latestCheckpoint, data.f);
-    const host = checks.get(0);
+    const host = checks.get(this.host);
     if (host !== undefined) {
       for (const value of checks.values())
         if (value !== host)
           throw new Error(`State mismatch at frame ${data.f}`);
-      if (peer.player === 0)
+      if (peer.player === this.host)
         for (const other of this.peers.values())
           if (other.kind === "native") other.sendCrc(data.f, data.crc);
     }
@@ -637,11 +770,15 @@ class Room {
     this.resyncs.push(now);
     if (this.requestedFrame !== undefined) return;
     this.requestedFrame = this.nextHostFrame;
-    jsonPeer(this.peers.get(0), { t: "state-request", f: this.requestedFrame });
+    jsonPeer(this.peers.get(this.host), {
+      t: "state-request",
+      f: this.requestedFrame,
+    });
   }
 
   pause(peer, paused) {
     if (!this.started) throw new Error("Pause requested before start");
+    this.paused = paused;
     for (const other of this.peers.values()) {
       if (other.kind === "native") {
         if (other !== peer)
@@ -649,7 +786,8 @@ class Room {
             paused ? CMD.PAUSE : CMD.RESUME,
             paused ? fixedString(peer.nickname) : undefined,
           );
-      } else jsonPeer(other, { t: "pause", paused });
+      } else if (!this.manifest.manualStart || other.playing)
+        jsonPeer(other, { t: "pause", paused });
     }
   }
 
@@ -661,12 +799,130 @@ class Room {
     }
   }
 
+  electHost() {
+    const current = this.peers.get(this.host);
+    if (current?.kind === "web" && (current.playing || !this.running)) return;
+    const web = [...this.peers.values()].filter((peer) => peer.kind === "web");
+    const next = web.find((peer) => peer.playing) ?? web[0];
+    this.host = next?.player ?? null;
+    this.manifest.owner = next?.owner ?? "";
+    if (next?.playing) {
+      this.progress = next.frame;
+      this.confirmed = next.confirmed;
+    }
+  }
+
+  fillVacancies() {
+    if (!this.manifest.manualStart || !this.running) return;
+    const active = [...this.peers.values()].filter((peer) => peer.playing);
+    if (!active.length) return;
+    const end = Math.max(...active.map((peer) => peer.nextFrame));
+    for (const [player, next] of this.vacant) {
+      for (let frame = next; frame < end; frame++)
+        this.relayInput({ player }, frame, 0);
+      this.vacant.set(player, Math.max(next, end));
+    }
+  }
+
+  tickNativeClock() {
+    if (
+      !this.running ||
+      this.paused ||
+      [...this.peers.values()].some(
+        (peer) => peer.kind === "web" && peer.playing,
+      )
+    ) {
+      this.nativeClockAt = performance.now();
+      return;
+    }
+    const slaves = [...this.peers.values()].filter(
+      (peer) => peer.kind === "native" && peer.slave && peer.playing,
+    );
+    if (!slaves.length) return;
+    const now = performance.now(),
+      interval = 1000 / (this.manifest.system === "snes" ? 60.0988 : 59.7275);
+    if (now - this.nativeClockAt < interval) return;
+    this.nativeClockAt = now;
+    for (const peer of slaves) {
+      if (peer.nextFrame > peer.lastReportedFrame - peer.frameOffset + 3)
+        continue;
+      this.input(peer, peer.nextFrame, peer.buttons);
+    }
+  }
+
+  probePeers() {
+    this.expireReservations();
+    if (!this.peers.size && !this.reservations.size) {
+      this.close("No players connected");
+      return;
+    }
+    const now = performance.now();
+    for (const peer of this.peers.values()) {
+      if (peer.kind === "native" && peer.phase !== "connected") continue;
+      if (peer.probe) {
+        if (now - peer.probe.sent > 6000) peer.ping = null;
+        if (now - peer.probe.sent > 15000) {
+          if (peer.kind === "native") peer.close();
+          else peer.ws.terminate();
+        }
+        continue;
+      }
+      peer.probe = { sent: now, nonce: token() };
+      try {
+        if (peer.kind === "native") peer.send(CMD.PING);
+        else jsonPeer(peer, { t: "ping", nonce: peer.probe.nonce });
+      } catch {
+        if (peer.kind === "native") peer.close();
+        else peer.ws.terminate();
+      }
+    }
+    this.publishPings();
+  }
+
+  pong(peer, nonce) {
+    if (!peer.probe || (peer.kind === "web" && peer.probe.nonce !== nonce))
+      return;
+    const sample = performance.now() - peer.probe.sent;
+    peer.ping = Math.round(
+      peer.ping === null || peer.ping === undefined
+        ? sample
+        : peer.ping * 0.7 + sample * 0.3,
+    );
+    peer.probe = null;
+    this.publishPings();
+  }
+
+  publishPings() {
+    this.notify({
+      t: "latency",
+      members: [...this.peers.values()].map((peer) => ({
+        player: peer.player,
+        ping: peer.ping ?? null,
+      })),
+    });
+  }
+
   depart(peer, message) {
     if (this.closed || this.peers.get(peer.player) !== peer) return;
     this.peers.delete(peer.player);
-    if (this.manifest.manualStart && !this.starting && !this.started)
-      this.seats[peer.player] = null;
     this.pendingBatteries.delete(peer.player);
+    if (this.manifest.manualStart) {
+      if (!this.peers.size) {
+        this.close("The last player left");
+        return;
+      }
+      const wasHost = peer.player === this.host;
+      if (peer.playing && this.running)
+        this.vacant.set(peer.player, peer.nextFrame);
+      this.seats[peer.player] = null;
+      this.electHost();
+      this.notify({ t: "peer-left", player: peer.player, message });
+      if (this.starting && wasHost && this.host !== null) this.prepareGame();
+      else if (this.starting) this.maybeStart();
+      this.fillVacancies();
+      this.lobby();
+      return;
+    }
     if (this.started || this.starting || peer.player === 0) this.close(message);
     else {
       this.notify({ t: "peer-left", player: peer.player, message });
@@ -678,6 +934,8 @@ class Room {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.timer);
+    clearInterval(this.heartbeat);
+    clearInterval(this.nativeClock);
     this.bridge.rooms.delete(this.id);
     for (const peer of this.peers.values()) {
       if (peer.kind === "native") peer.close();
@@ -770,13 +1028,19 @@ export async function createBridge({
           let allocated = false;
           for (let candidate = portStart; candidate <= portEnd; candidate++) {
             const listener = createTcpServer((socket) => {
-              const slot = room.available();
-              if (room.closed || room.started || room.starting || slot < 0) {
+              const slot = room.available(true);
+              if (
+                room.closed ||
+                (room.started && !room.manifest.manualStart) ||
+                room.starting ||
+                slot < 0
+              ) {
                 socket.destroy();
                 return;
               }
               const peer = new NativePeer(room, socket, slot);
               room.peers.set(slot, peer);
+              if (room.manifest.manualStart) room.seats[slot] = null;
               room.lobby();
             });
             try {
@@ -823,7 +1087,7 @@ export async function createBridge({
       }
       if (request.method === "POST" && match[2]) {
         const data = await body(request);
-        if (room.started || room.starting)
+        if ((room.started && !room.manifest.manualStart) || room.starting)
           return reply(409, { error: "Room has started" });
         if (room.password && !secretEqual(data.password, room.password))
           return reply(403, { error: "Incorrect room password" });
@@ -860,7 +1124,8 @@ export async function createBridge({
     const room = match && rooms.get(match[1]);
     if (
       !room ||
-      room.started ||
+      (room.started && !room.manifest.manualStart) ||
+      room.starting ||
       (allowedOrigins.length &&
         !allowedOrigins.includes(request.headers.origin))
     )
@@ -868,7 +1133,7 @@ export async function createBridge({
     const credential = url.searchParams.get("token");
     for (const [slot, reservation] of room.reservations) {
       if (
-        (match[2] === "host") !== (slot === 0) ||
+        (match[2] === "host" && slot !== 0) ||
         reservation.until < Date.now() ||
         !secretEqual(credential, reservation.credential)
       )

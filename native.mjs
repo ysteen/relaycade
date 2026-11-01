@@ -38,6 +38,8 @@ export class NativePeer {
     this.pendingChecks = new Map();
     this.checksSent = 0;
     this.buttons = 0;
+    this.serverFrame = 0;
+    this.playing = false;
     this.salt = room.password ? randomBytes(4).readUInt32BE() || 1 : 0;
     this.decoder = new Decoder(
       (header) => this.header(header),
@@ -71,6 +73,9 @@ export class NativePeer {
   }
 
   send(command, data) {
+    if (command === CMD.INPUT && data.readUInt32BE(4) === 0)
+      this.serverFrame = data.readUInt32BE(0) + 1;
+    if (command === CMD.NOINPUT) this.serverFrame = data.readUInt32BE(0) + 1;
     this.write(packet(command, data));
   }
 
@@ -149,7 +154,11 @@ export class NativePeer {
       throw new Error("Native handshake is waiting for the web host state");
     switch (command) {
       case CMD.PLAY:
-        if (data.length !== 4 || this.ready || this.room.started)
+        if (
+          data.length !== 4 ||
+          this.ready ||
+          (this.room.started && !this.room.manifest.manualStart)
+        )
           throw new Error("Invalid native play request");
         this.ready = true;
         if (this.room.manifest.manualStart) clearTimeout(this.timeout);
@@ -157,6 +166,14 @@ export class NativePeer {
         this.room.maybeStart();
         return;
       case CMD.INPUT:
+        if (this.restarting) {
+          if (data.length !== 12) throw new Error("Invalid native input");
+          this.lastReportedFrame = Math.max(
+            this.lastReportedFrame,
+            data.readUInt32BE(0),
+          );
+          return;
+        }
         if (!this.room.started || data.length !== 12)
           throw new Error("Unexpected native input");
         if (!this.slave) {
@@ -182,6 +199,18 @@ export class NativePeer {
           throw new Error("Invalid native joypad input");
         return;
       case CMD.LOAD_STATE: {
+        if (this.restartSourceRequested) {
+          const { state } = readStatePayload(
+            data,
+            this.protocol,
+            this.compressed,
+            this.room.manifest.stateSize,
+          );
+          this.restartSourceRequested = false;
+          clearTimeout(this.sourceTimeout);
+          if (this.room.starting) this.room.prepareGame(state);
+          return;
+        }
         if (
           !this.calibration ||
           !this.bootstrapping ||
@@ -218,8 +247,15 @@ export class NativePeer {
         this.send(CMD.PONG);
         return;
       case CMD.ACK:
+        if (data.length) throw new Error("Unexpected acknowledgement payload");
+        return;
       case CMD.PONG:
         if (data.length) throw new Error("Unexpected acknowledgement payload");
+        this.room.pong?.(this);
+        if (this.restarting && --this.restartPongs === 0) {
+          this.restartReady = true;
+          this.room.maybeStart();
+        }
         return;
       case CMD.PAUSE:
         if (data.length !== 32) throw new Error("Invalid pause");
@@ -264,7 +300,12 @@ export class NativePeer {
   }
 
   start() {
+    if (this.restarting) {
+      this.bootstrapped = true;
+      return;
+    }
     this.bootstrapping = true;
+    this.wireSeats = this.room.seats.slice();
     if (this.room.manifest.manualStart) {
       this.timeout = setTimeout(
         () => this.drop("Native startup timed out"),
@@ -294,8 +335,71 @@ export class NativePeer {
 
   finishStart() {
     clearTimeout(this.timeout);
+    if (this.restarting) {
+      this.finishRestart();
+      return;
+    }
     this.sendState(0, this.room.state);
     // Apply the state in a stalled post-frame pass before any new emulation.
+    this.send(CMD.STALL, words(1));
+  }
+
+  requestRestartSource() {
+    this.restartSourceRequested = true;
+    this.send(CMD.REQUEST_STATE);
+    this.sourceTimeout = setTimeout(() => {
+      this.restartSourceRequested = false;
+      this.room.starting = false;
+      this.room.notify({
+        t: "action-error",
+        message: "Could not read the current game state. Try restarting again.",
+      });
+      this.room.lobby();
+    }, 10000);
+    this.sourceTimeout.unref();
+  }
+
+  prepareRestart() {
+    this.restarting = true;
+    this.restartReady = false;
+    this.restartPongs = this.probe ? 2 : 1;
+    this.nativeInputsReady = false;
+    this.pendingInputs.length = 0;
+    this.pendingChecks.clear();
+    // RetroArch 1.22.2 can retain remote_paused after RESUME. A bounded stall
+    // drains old input without entering that persistent pause state.
+    this.send(CMD.STALL, words(60));
+    this.send(CMD.PING);
+    this.timeout = setTimeout(
+      () => this.drop("Native restart timed out"),
+      15000,
+    );
+    this.timeout.unref();
+  }
+
+  finishRestart() {
+    const base = Math.max(this.serverFrame, this.lastReportedFrame + 1);
+    for (let frame = this.serverFrame; frame < base; frame++)
+      this.send(CMD.NOINPUT, words(frame));
+    for (let player = 0; player < this.room.manifest.players; player++) {
+      const seat = this.room.seats[player];
+      if (player === this.player || this.wireSeats[player] === seat) continue;
+      const nickname = this.room.peers.get(player)?.nickname ?? "Empty";
+      const removed = modePayload(base, player, nickname, false, false, seat);
+      removed.writeUInt32BE(player, 4);
+      removed.writeUInt32BE(0, 8);
+      this.send(CMD.MODE, removed);
+      this.send(
+        CMD.MODE,
+        modePayload(base, player, nickname, false, false, seat),
+      );
+    }
+    this.wireSeats = this.room.seats.slice();
+    this.frameOffset = base;
+    this.nextWireFrame = base;
+    this.nextFrame = 0;
+    this.restarting = false;
+    this.sendState(0, this.room.state);
     this.send(CMD.STALL, words(1));
   }
 
@@ -381,6 +485,7 @@ export class NativePeer {
 
   close() {
     clearTimeout(this.timeout);
+    clearTimeout(this.sourceTimeout);
     this.socket.destroy();
   }
 }
