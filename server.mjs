@@ -76,6 +76,8 @@ function validateManifest(body) {
       "Native calibration requires the qualified two-player SameBoy profile",
     );
   const owner = boundedString(body.owner, "", 128);
+  if (body.manualStart !== undefined && typeof body.manualStart !== "boolean")
+    throw new Error("Invalid manualStart flag");
   if (
     body.romId !== undefined &&
     (!Number.isSafeInteger(body.romId) || body.romId < 1)
@@ -92,6 +94,7 @@ function validateManifest(body) {
     owner,
     romId: body.romId ?? null,
     nativeAllowed: body.nativeAllowed ?? false,
+    manualStart: body.manualStart ?? false,
     nativeCalibration: body.nativeCalibration,
     nickname: boundedString(body.nickname, "RomM", 31),
   };
@@ -125,6 +128,10 @@ class Room {
     this.sram = Buffer.alloc(0);
     this.revision = 0;
     this.started = false;
+    this.starting = false;
+    this.seats = Array.from({ length: manifest.players }, (_, player) =>
+      manifest.manualStart ? null : player,
+    );
     this.closed = false;
     this.nextHostFrame = 0;
     this.progress = 0;
@@ -135,7 +142,7 @@ class Room {
     this.resyncs = [];
     this.timer = setTimeout(
       () => this.close("Room setup timed out"),
-      5 * 60000,
+      (manifest.manualStart ? 30 : 5) * 60000,
     );
     this.timer.unref();
   }
@@ -169,7 +176,7 @@ class Room {
       players,
       stateSize,
       current: this.peers.size + this.reservations.size,
-      started: this.started,
+      started: this.started || this.starting,
       tcpPort: this.tcpPort ?? null,
       hasPassword: !!this.password,
     };
@@ -199,6 +206,79 @@ class Room {
     return -1;
   }
 
+  canStart() {
+    return (
+      !!this.state &&
+      !this.started &&
+      !this.starting &&
+      this.peers.size === this.manifest.players &&
+      this.seats.every((seat) => seat !== null) &&
+      [...this.peers.values()].every(
+        (peer) => peer.kind === "web" || peer.ready,
+      )
+    );
+  }
+
+  lobby() {
+    if (!this.manifest.manualStart || this.closed) return;
+    this.notify({
+      t: "lobby",
+      players: this.manifest.players,
+      seats: this.seats,
+      starting: this.starting || this.started,
+      canStart: this.canStart(),
+      members: [...this.peers.values()].map((peer) => ({
+        player: peer.player,
+        nickname: peer.nickname,
+        kind: peer.kind,
+        ready: peer.kind === "web" || peer.ready,
+      })),
+    });
+  }
+
+  control(peer, data) {
+    const reject = (message) => jsonPeer(peer, { t: "action-error", message });
+    if (!this.manifest.manualStart)
+      return reject("This room does not have a lobby");
+    if (this.started || this.starting)
+      return reject("The game is already starting or running");
+    if (data.t === "assign") {
+      if (peer.player !== 0 && data.player !== peer.player)
+        return reject("You can only change your own player number");
+      if (
+        !Number.isInteger(data.player) ||
+        !this.peers.has(data.player) ||
+        (data.seat !== null &&
+          (!Number.isInteger(data.seat) ||
+            data.seat < 0 ||
+            data.seat >= this.manifest.players))
+      )
+        return reject("Choose a connected player and a valid player number");
+      const other = this.seats.indexOf(data.seat);
+      if (data.seat !== null && other !== -1 && other !== data.player)
+        return reject("That player number is already selected");
+      this.seats[data.player] = data.seat;
+      this.lobby();
+      return;
+    }
+    if (peer.player !== 0) return reject("Only the host can start the game");
+    if (!this.canStart())
+      return reject(
+        "Wait for every player to connect and choose a player number",
+      );
+    this.starting = true;
+    for (const other of this.peers.values()) {
+      if (other.kind === "web") {
+        other.ready = -1;
+        other.battery = other.player === 0;
+        if (other.player) this.pendingBatteries.add(other.player);
+      }
+    }
+    this.lobby();
+    for (const other of this.peers.values())
+      jsonPeer(other, { t: "prepare", seats: this.seats });
+  }
+
   attach(ws, slot, reservation) {
     this.reservations.delete(slot);
     const peer = {
@@ -219,6 +299,7 @@ class Room {
       t: "joined",
       player: slot,
       players: this.manifest.players,
+      ...(this.manifest.manualStart ? { manualStart: true } : {}),
     });
     ws.on("message", (bytes, binary) => {
       try {
@@ -235,13 +316,19 @@ class Room {
     });
     ws.on("error", () => this.depart(peer, "Web connection failed"));
     ws.on("close", () => this.depart(peer, "Web peer disconnected"));
-    if (slot && this.state) this.sendWebState(peer, 0);
+    if (slot && this.state && !this.manifest.manualStart)
+      this.sendWebState(peer, 0);
+    this.lobby();
   }
 
   message(peer, data) {
     if (!data || typeof data !== "object" || Array.isArray(data))
       throw new Error("Invalid web message");
     switch (data.t) {
+      case "assign":
+      case "start-request":
+        this.control(peer, data);
+        return;
       case "state":
         if (
           peer.player !== 0 ||
@@ -271,6 +358,7 @@ class Room {
         if (
           !peer.player ||
           this.started ||
+          (this.manifest.manualStart && !this.starting) ||
           peer.battery ||
           !uint(data.size) ||
           data.size > 131072
@@ -377,7 +465,11 @@ class Room {
     } else {
       for (const other of this.peers.values()) {
         if (other.kind === "native") other.sync();
-        if (other !== peer && other.kind === "web") {
+        if (
+          other !== peer &&
+          other.kind === "web" &&
+          (!this.manifest.manualStart || this.starting)
+        ) {
           other.ready = -1;
           this.sendWebState(other, 0);
         }
@@ -388,6 +480,7 @@ class Room {
       revision: this.revision,
       f: transfer.f,
     });
+    this.lobby();
   }
 
   sendWebState(peer, frame) {
@@ -415,6 +508,7 @@ class Room {
     if (
       this.started ||
       this.closed ||
+      (this.manifest.manualStart && !this.starting) ||
       !this.state ||
       this.pendingBatteries.size ||
       this.peers.size !== this.manifest.players
@@ -570,9 +664,14 @@ class Room {
   depart(peer, message) {
     if (this.closed || this.peers.get(peer.player) !== peer) return;
     this.peers.delete(peer.player);
+    if (this.manifest.manualStart && !this.starting && !this.started)
+      this.seats[peer.player] = null;
     this.pendingBatteries.delete(peer.player);
-    if (this.started || peer.player === 0) this.close(message);
-    else this.notify({ t: "peer-left", player: peer.player, message });
+    if (this.started || this.starting || peer.player === 0) this.close(message);
+    else {
+      this.notify({ t: "peer-left", player: peer.player, message });
+      this.lobby();
+    }
   }
 
   close(message = "Room closed") {
@@ -672,12 +771,13 @@ export async function createBridge({
           for (let candidate = portStart; candidate <= portEnd; candidate++) {
             const listener = createTcpServer((socket) => {
               const slot = room.available();
-              if (room.closed || room.started || slot < 0) {
+              if (room.closed || room.started || room.starting || slot < 0) {
                 socket.destroy();
                 return;
               }
               const peer = new NativePeer(room, socket, slot);
               room.peers.set(slot, peer);
+              room.lobby();
             });
             try {
               await new Promise((resolve, reject) => {
@@ -723,7 +823,8 @@ export async function createBridge({
       }
       if (request.method === "POST" && match[2]) {
         const data = await body(request);
-        if (room.started) return reply(409, { error: "Room has started" });
+        if (room.started || room.starting)
+          return reply(409, { error: "Room has started" });
         if (room.password && !secretEqual(data.password, room.password))
           return reply(403, { error: "Incorrect room password" });
         const slot = room.available();

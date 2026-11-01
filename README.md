@@ -43,6 +43,8 @@ flowchart LR
 
 RomM owns account authentication, game access, room permissions, and save uploads. The bridge accepts administrative requests from the RomM backend using a shared service token. The token stays on the backend. Browser clients receive expiring, single-use connection tokens; native clients use RetroArch's existing room password protocol. No separate OIDC provider is needed for this adapter.
 
+RomM rooms use a waiting room with an explicit host start. Everyone initially has no player number. Guests can select their own number; the host can assign anyone's number, including native guests. Numbers must be unique and every slot must be connected and assigned before starting. Leaving the creation password blank creates a passwordless room; web guests still sign in to RomM.
+
 Configure the RomM backend with:
 
 ```dotenv

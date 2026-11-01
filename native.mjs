@@ -152,6 +152,8 @@ export class NativePeer {
         if (data.length !== 4 || this.ready || this.room.started)
           throw new Error("Invalid native play request");
         this.ready = true;
+        if (this.room.manifest.manualStart) clearTimeout(this.timeout);
+        this.room.lobby();
         this.room.maybeStart();
         return;
       case CMD.INPUT:
@@ -251,6 +253,7 @@ export class NativePeer {
         this.player,
         this.nickname,
         this.room.sram,
+        this.room.seats[0] ?? 0,
       ),
     );
     if (this.protocol >= 6) {
@@ -262,12 +265,26 @@ export class NativePeer {
 
   start() {
     this.bootstrapping = true;
+    if (this.room.manifest.manualStart) {
+      this.timeout = setTimeout(
+        () => this.drop("Native startup timed out"),
+        30000,
+      );
+      this.timeout.unref();
+    }
     if (this.calibration) this.send(CMD.REQUEST_STATE);
     for (const peer of this.room.peers.values()) {
-      if (peer.player === 0) continue;
+      if (peer.player === 0 && !this.room.manifest.manualStart) continue;
       this.send(
         CMD.MODE,
-        modePayload(0, peer.player, peer.nickname, peer === this, peer.slave),
+        modePayload(
+          0,
+          peer.player,
+          peer.nickname,
+          peer === this,
+          peer.slave,
+          this.room.seats[peer.player],
+        ),
       );
     }
     for (const peer of this.room.peers.values())

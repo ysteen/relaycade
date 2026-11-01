@@ -1,12 +1,12 @@
 # Netplay bridge protocol 1
 
-The bridge runs separately from RomM. It does not execute a core. A browser in slot 0 supplies the authoritative state. Every participant runs the complete emulation locally: linked handhelds for GB/GBA, or one console with two joypads for SNES.
+The bridge runs separately from RomM. It does not execute a core. The browser with wire player ID 0 supplies the authoritative state. Every participant runs the complete emulation locally: linked handhelds for GB/GBA, or one console with two joypads for SNES. Wire player IDs stay fixed; the waiting room can assign different emulated controller or console numbers.
 
 ## Administration
 
 All `/v1/rooms` HTTP requests require `Authorization: Bearer <NETPLAY_BRIDGE_ADMIN_TOKEN>`.
 
-- `POST /v1/rooms`: `{system, coreName, coreVersion, contentCrc, stateSize, players, nativeAllowed, owner?, romId?, nickname?, password?, nativeCalibration?, maxPrediction?}`. Systems are `gb` (2 players), `gba` (2 to 4), and experimental `snes` (2). The content CRC is an unsigned integer. Core state size is 1 to 16 MiB. `nativeAllowed` defaults to false. An omitted password is generated. Returns `{id, hostToken, hostPath, tcpPort, password, players}`. `tcpPort` is null for web-only rooms.
+- `POST /v1/rooms`: `{system, coreName, coreVersion, contentCrc, stateSize, players, nativeAllowed, owner?, romId?, nickname?, password?, nativeCalibration?, maxPrediction?, manualStart?}`. Systems are `gb` (2 players), `gba` (2 to 4), and experimental `snes` (2). The content CRC is an unsigned integer. Core state size is 1 to 16 MiB. `nativeAllowed` and `manualStart` default to false. An omitted password is generated; an explicit empty string creates a passwordless room. RomM sends the empty string for a blank creation field. Returns `{id, hostToken, hostPath, tcpPort, password, players}`. `tcpPort` is null for web-only rooms.
 - `POST /v1/rooms/:id/join`: `{owner?, nickname?, password?}` reserves a web slot and returns `{id, player, peerToken, peerPath, players, tcpPort, password}`. The password must match when the room has one.
 - `GET /v1/rooms`: array of room metadata. Credentials are omitted.
 - `DELETE /v1/rooms/:id`: closes the room and all its connections.
@@ -23,6 +23,19 @@ Connect to `hostPath` or `peerPath` with WebSocket. The bridge sends `{t:"joined
 3. Every web guest sends `{t:"battery", size}` and its battery bytes, including an empty binary frame when size is zero. The bridge forwards both to the host, adding `player` to the header.
 4. Host imports that battery into its corresponding slot and sends a new state, adding `batteryPlayer` to the header. The bridge broadcasts `{t:"state", f, size, revision}` and bytes to guests. Each guest loads it and replies `{t:"ready", revision}`.
 5. Once every reserved slot is connected, web guests have supplied batteries, everyone acknowledges the latest state, and native peers have requested play, the bridge sends `{t:"start", f:0, player, players, maxPrediction}` to each browser. Native clients receive the latest state and controller assignments first.
+
+### Waiting room
+
+With `manualStart: true`, the joined message also contains `manualStart: true`. The host sends its initial state for native handshakes, but guest battery exchange and the start barrier wait for the host's start request. Waiting rooms expire after 30 minutes if they never start.
+
+- The bridge broadcasts `{t:"lobby", players, seats, starting, canStart, members}`. `seats[wirePlayer]` is a zero-based emulated controller/console number or `null`. Every seat is initially `null`. Members contain `{player, nickname, kind, ready}`.
+- A browser sends `{t:"assign", player, seat}` to select or clear a number. Guests may change only their own assignment; wire player 0 may change any connected member. Occupied numbers cannot be reassigned until cleared.
+- Only wire player 0 may send `{t:"start-request"}`. All slots must be connected and ready, and every number must be assigned exactly once. Rejected lobby actions return `{t:"action-error", message}` without closing the room.
+- The bridge freezes assignments and broadcasts `{t:"prepare", seats}`. The host restores its initial state and imports its battery into its assigned console. Guests then send their batteries; the host imports each into its assigned console. SNES always uses the host's shared memory ID 0. The normal latest-state barrier above then starts play.
+- Input messages retain wire player IDs. Browser clients route inputs to the assigned emulated devices, and native MODE messages carry the matching controller masks. Choosing P2 does not transfer host authority.
+- A guest leaving before preparation frees their number and slot. Departure during preparation or play, or any host departure, closes the room. A waiting native client has no handshake timeout after completing PLAY; the room's setup deadline still applies.
+
+When `manualStart` is false, wire IDs map directly to emulated numbers and the existing automatic start behavior remains available.
 
 SNES uses the host's shared cartridge save. Its web guests must send an empty
 battery transfer; a guest's independent save cannot replace the shared console's

@@ -65,11 +65,11 @@ export function infoPayload(manifest) {
   ]);
 }
 
-export function syncPayload(manifest, player, nickname, sram) {
+export function syncPayload(manifest, player, nickname, sram, hostSeat = 0) {
   const devices = Buffer.alloc(DEVICES * 4);
   for (let i = 0; i < manifest.players; i++) devices.writeUInt32BE(1, i * 4);
   const clients = Buffer.alloc(DEVICES * 4);
-  clients.writeUInt32BE(1, 0);
+  clients.writeUInt32BE(1, hostSeat * 4);
   return Buffer.concat([
     words(0, player),
     devices,
@@ -86,12 +86,13 @@ export function modePayload(
   nickname,
   self = false,
   slave = false,
+  seat = player,
 ) {
   return Buffer.concat([
     words(
       frame,
       (self ? 0xc0000000 : 0x40000000) | (slave ? 0x20000000 : 0) | player,
-      1 << player,
+      1 << seat,
     ),
     Buffer.alloc(DEVICES),
     fixedString(nickname),

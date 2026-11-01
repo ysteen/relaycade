@@ -21,12 +21,22 @@ class Socket extends EventEmitter {
   }
 }
 
-function fixture(t, { maxPrediction = 8, autoStart = true } = {}) {
+function fixture(
+  t,
+  {
+    maxPrediction = 8,
+    autoStart = true,
+    manualStart = false,
+    seats = [0, 1],
+  } = {},
+) {
   const socket = new Socket();
   const inputs = [];
   const events = [];
   const room = {
-    manifest: { maxPrediction, stateSize: 128 },
+    manifest: { maxPrediction, stateSize: 128, manualStart },
+    seats,
+    lobby() {},
     password: "",
     state: Buffer.alloc(128, 7),
     peers: new Map([[0, { player: 0, nickname: "Web" }]]),
@@ -57,6 +67,16 @@ function fixture(t, { maxPrediction = 8, autoStart = true } = {}) {
   peer.start();
   return { peer, room, socket, inputs, events };
 }
+
+test("lobby assignments map native wire identities to the chosen controller ports", (t) => {
+  const { socket } = fixture(t, { manualStart: true, seats: [1, 0] });
+  const modes = socket.packets.filter((p) => p.command === CMD.MODE);
+  assert.equal(modes.length, 2);
+  assert.equal(modes[0].data.readUInt32BE(4) & 0xffff, 0);
+  assert.equal(modes[0].data.readUInt32BE(8), 2);
+  assert.equal(modes[1].data.readUInt32BE(4) & 0xffff, 1);
+  assert.equal(modes[1].data.readUInt32BE(8), 1);
+});
 
 test("prediction opt-in uses ordinary playing mode without self input echoes", (t) => {
   const { peer, socket } = fixture(t);
