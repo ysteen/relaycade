@@ -28,6 +28,18 @@ docker compose up -d --build
 
 The container exposes HTTP on loopback port 8082 and native TCP ports 55435–55442. It runs as a non-root user with a read-only filesystem, one CPU, and a 256 MiB memory limit. Configure the published bind addresses for the intended network. Browser connections require an HTTPS reverse proxy with WebSocket upgrade support. Native clients connect to the native hostname and room port directly.
 
+Native connection diagnostics are JSON records on standard output. Use
+`docker compose logs -f netplay-bridge` to follow accepted connections, negotiated
+protocols, core/version/ROM CRC comparisons, synchronization and disconnect
+reasons. Passwords, login tokens, nicknames and game/state payloads are excluded.
+`native-error` includes the handshake phase; `native-core-info` includes the
+received and expected ROM CRC values. A CRC mismatch requires identical ROM
+bytes, including the same translation patch and revision.
+
+In RetroArch 1.22.2's **Connect to Netplay Host** address prompt, use
+`hostname|port`, for example `192.168.3.100|55435`, or configure the server address
+and TCP port separately. The prompt does not split `hostname:port`.
+
 ## RomM integration
 
 For installation, WebSocket/TCP proxy setup, web invitations and native RetroArch

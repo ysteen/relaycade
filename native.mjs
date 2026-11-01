@@ -26,6 +26,8 @@ export class NativePeer {
       phase: "header",
       ready: false,
     });
+    this.connectedAt = Date.now();
+    this.log("native-connected", { remoteAddress: socket.remoteAddress });
     this.nextFrame = 0;
     this.slave = !(room.manifest.maxPrediction > 0);
     this.nextWireFrame = 0;
@@ -58,10 +60,28 @@ export class NativePeer {
         this.drop(error.message);
       }
     });
-    socket.on("error", () => this.drop("Native connection failed"));
+    socket.on("error", (error) =>
+      this.drop("Native connection failed", { code: error.code }),
+    );
     socket.on("close", () => {
       clearTimeout(this.timeout);
+      this.log("native-closed", {
+        reason: this.closeReason ?? "Peer closed the connection",
+        durationMs: Date.now() - this.connectedAt,
+        receivedBytes: socket.bytesRead,
+        sentBytes: socket.bytesWritten,
+      });
       room.depart(this, "Native peer disconnected");
+    });
+  }
+
+  log(event, fields = {}) {
+    this.room.bridge?.log(event, {
+      room: this.room.id,
+      port: this.room.tcpPort,
+      player: this.player,
+      phase: this.phase,
+      ...fields,
     });
   }
 
@@ -88,6 +108,10 @@ export class NativePeer {
     if (low > 7 || this.protocol < 5 || this.protocol < low)
       throw new Error("Unsupported RetroArch protocol");
     this.compressed = !!(bytes.readUInt32BE(8) & 1);
+    this.log("native-protocol", {
+      protocol: this.protocol,
+      compressed: this.compressed,
+    });
     this.write(
       words(
         MAGIC,
@@ -139,6 +163,14 @@ export class NativePeer {
       const version = readString(data.subarray(36, 68));
       const crc = data.readUInt32BE(0);
       const expected = this.room.manifest;
+      this.log("native-core-info", {
+        coreName: name,
+        coreVersion: version,
+        contentCrc: crc,
+        expectedCoreName: expected.coreName,
+        expectedCoreVersion: expected.coreVersion,
+        expectedContentCrc: expected.contentCrc,
+      });
       if (
         name.toLowerCase() !== expected.coreName.toLowerCase() ||
         version !== expected.coreVersion
@@ -161,6 +193,7 @@ export class NativePeer {
         )
           throw new Error("Invalid native play request");
         this.ready = true;
+        this.log("native-ready");
         if (this.room.manifest.manualStart) clearTimeout(this.timeout);
         this.room.lobby();
         this.room.maybeStart();
@@ -297,6 +330,7 @@ export class NativePeer {
       this.send(CMD.LATENCY, words(0, 0));
     }
     this.phase = "connected";
+    this.log("native-synced", { sramBytes: this.room.sram.length });
   }
 
   start() {
@@ -471,9 +505,11 @@ export class NativePeer {
     );
   }
 
-  drop(message) {
+  drop(message, details = {}) {
     if (this.dropped) return;
     this.dropped = true;
+    this.closeReason = message;
+    this.log("native-error", { reason: message, ...details });
     this.room.notify({ t: "peer-error", player: this.player, message });
     try {
       this.send(CMD.NAK);

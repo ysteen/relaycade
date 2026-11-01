@@ -132,11 +132,12 @@ class Queue {
   }
 }
 
-async function fixture(t) {
+async function fixture(t, { logger = () => {} } = {}) {
   const bridge = await createBridge({
     adminToken: ADMIN,
     portStart: 0,
     portEnd: 0,
+    logger,
   });
   t.after(() => bridge.close());
   const base = `http://127.0.0.1:${bridge.address.port}`;
@@ -164,6 +165,55 @@ async function fixture(t) {
   }
   return { bridge, api, web, base };
 }
+
+test("native diagnostics record mismatch phases without credentials or nicknames", async (t) => {
+  const entries = [];
+  const f = await fixture(t, { logger: (entry) => entries.push(entry) });
+  const nickname = "private-test-nickname";
+  for (const password of ["", "private-test-room-password"]) {
+    const { data: room } = await f.api("/v1/rooms", {
+      ...manifest,
+      nativeAllowed: true,
+      password,
+    });
+    const socket = connect(room.tcpPort, "127.0.0.1");
+    socket.on("error", () => {});
+    socket.on("data", () => {});
+    t.after(() => socket.destroy());
+    await once(socket, "connect");
+    const closed = once(socket, "close");
+    socket.write(
+      Buffer.concat([
+        words(MAGIC, (8 << 15) | 8, 0, 7, 5, 0),
+        packet(CMD.NICK, fixedString(nickname)),
+        password
+          ? packet(CMD.PASSWORD, Buffer.alloc(64, 48))
+          : packet(
+              CMD.INFO,
+              infoPayload({ ...manifest, coreVersion: "wrong-version" }),
+            ),
+      ]),
+    );
+    await closed;
+  }
+  const errors = entries.filter((entry) => entry.event === "native-error");
+  assert.deepEqual(
+    errors.map(({ phase }) => phase),
+    ["info", "password"],
+  );
+  assert.match(errors[0].reason, /Core name or version/);
+  assert.equal(errors[1].reason, "Incorrect room password");
+  assert(
+    entries.some(
+      (entry) =>
+        entry.event === "native-core-info" &&
+        entry.coreVersion === "wrong-version",
+    ),
+  );
+  assert(entries.some((entry) => entry.event === "native-closed"));
+  assert(!JSON.stringify(entries).includes(nickname));
+  assert(!JSON.stringify(entries).includes("private-test-room-password"));
+});
 
 async function initial(host, state = Buffer.alloc(128, 17), extra = {}) {
   host.send({ t: "state", f: 0, size: state.length, sram: "", ...extra });

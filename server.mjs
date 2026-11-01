@@ -932,6 +932,11 @@ class Room {
 
   close(message = "Room closed") {
     if (this.closed) return;
+    this.bridge.log("room-closed", {
+      room: this.id,
+      port: this.tcpPort ?? null,
+      reason: message,
+    });
     this.closed = true;
     clearTimeout(this.timer);
     clearInterval(this.heartbeat);
@@ -964,11 +969,17 @@ export async function createBridge({
   portEnd = 55442,
   maxRooms = 8,
   allowedOrigins = [],
+  logger = (entry) => console.info(JSON.stringify(entry)),
 } = {}) {
   if (typeof adminToken !== "string" || adminToken.length < 24)
     throw new Error("Bridge admin token must contain at least 24 characters");
   const rooms = new Map();
-  const bridge = { rooms };
+  const bridge = {
+    rooms,
+    log(event, fields = {}) {
+      logger({ time: new Date().toISOString(), event, ...fields });
+    },
+  };
   const wss = new WebSocketServer({
     noServer: true,
     maxPayload: MAX_STATE,
@@ -1035,6 +1046,18 @@ export async function createBridge({
                 room.starting ||
                 slot < 0
               ) {
+                bridge.log("native-rejected", {
+                  room: room.id,
+                  port: room.tcpPort,
+                  remoteAddress: socket.remoteAddress,
+                  reason: room.closed
+                    ? "Room closed"
+                    : room.starting
+                      ? "Room is starting"
+                      : slot < 0
+                        ? "Room is full"
+                        : "Room has started",
+                });
                 socket.destroy();
                 return;
               }
@@ -1069,6 +1092,14 @@ export async function createBridge({
           }
         }
         const hostToken = room.reserve(0, manifest.owner, manifest.nickname);
+        bridge.log("room-created", {
+          room: room.id,
+          port: room.tcpPort ?? null,
+          coreName: manifest.coreName,
+          coreVersion: manifest.coreVersion,
+          nativeAllowed: manifest.nativeAllowed,
+          players: manifest.players,
+        });
         return reply(201, {
           id: room.id,
           hostToken,
