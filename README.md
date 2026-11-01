@@ -8,7 +8,7 @@ A self-hosted input relay for browser cores and unmodified RetroArch clients. Ea
 | mGBA Splitscreen | `0.1.0-f1d5975-rollback1` (SPST4) | Two to four linked GBA consoles |
 | Snes9x           | `1.632d4cce69`                    | One SNES, two joypads           |
 
-The first two cores require matching native/WASM patches. Snes9x uses the pinned upstream core. All participants need identical cartridge bytes and matching core options. Native binaries qualified here are Linux x86_64 builds. See [qualification results](docs/core-qualification.md) for tested scenarios and limitations.
+The first two cores require matching native/WASM patches. Snes9x uses the pinned upstream core. All participants need identical cartridge bytes and matching core options. Linux x86_64, Windows x64/x86/ARM64 and four Android ABIs are available through the RomM adapter. See [native builds and verification limits](docs/native-builds.md) and [core qualification results](docs/core-qualification.md).
 
 ## Run
 
