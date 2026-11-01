@@ -6,6 +6,13 @@ patch is required. The browser suggests a download for the visitor's OS and CPU;
 the installed RetroArch app can have a different architecture, so manual
 selection remains available. Downloading a core does not occupy a room slot.
 
+For mGBA Splitscreen, also download `mgba_splitscreen_libretro.info` and copy it
+to **Settings → Directory → Core Info** in RetroArch. Keep its filename unchanged.
+Close RetroArch, remove `core_info.cache` from that directory if present, and
+reopen it to rebuild the extension list. Select the installed core under
+**Load Core**, then open the ROM under **Load Content**. Installing a DLL alone
+does not register this custom core's GBA extension in the shared content filter.
+
 | Platform | Builds                              | Verification                                                                                                                                                     |
 | -------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Windows  | x86_64, x86                         | All three DLLs load and report matching versions. mGBA/Snes9x restore and replay correctly, and match Linux state bytes after 120 frames from the same snapshot. |
@@ -32,6 +39,10 @@ python3 scripts/build-native-cores.py --help
 python3 scripts/build-native-cores.py
 python3 scripts/package-native-cores.py ../romm-netplay-publish
 ```
+
+The packager also installs the metadata in `core-info/` and records its checksum
+in the adapter catalog. Use `--info-only` to update this metadata without copying
+or inspecting native binaries.
 
 The default output is `../result/netplay-interop/cross-platform`. Pass `--work`,
 `--mingw`, `--ndk`, `--archives`, `--bootroms`, `--snes-source` and `--zlib-archive`

@@ -25,6 +25,7 @@ DIRECTORIES = {
     "mgba_splitscreen": "mgba-spst4",
     "snes9x": "snes9x-2d4cce69",
 }
+CORE_INFO = Path(__file__).resolve().parents[1] / "core-info"
 EXPORTS = {
     "retro_" + name
     for name in [
@@ -138,9 +139,27 @@ def inspect(binary, target, machine, llvm):
     }
 
 
+def install_core_info(romm, catalog):
+    for source in sorted(CORE_INFO.glob("*_libretro.info")):
+        core = source.name.removesuffix("_libretro.info")
+        folder = DIRECTORIES[core]
+        version = catalog[core]["native"]["coreVersion"]
+        assert f'display_version = "{version}"' in source.read_text(), source
+        destination = romm / "custom-emulatorjs/data/cores/compat/rollback" / folder
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination / source.name)
+        catalog[core]["native"]["coreInfo"] = {
+            "path": f"../data/cores/compat/rollback/{folder}/{source.name}",
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("romm", type=Path)
+    parser.add_argument(
+        "--info-only", action="store_true", help="Install core info without copying binaries"
+    )
     parser.add_argument(
         "--artifacts",
         type=Path,
@@ -155,6 +174,11 @@ def main():
     args = parser.parse_args()
     catalog_path = args.romm / "custom-emulatorjs/input-netplay/bridge-cores.json"
     catalog = json.loads(catalog_path.read_text())
+    if args.info_only:
+        install_core_info(args.romm, catalog)
+        catalog_path.write_text(json.dumps(catalog, indent=2) + "\n")
+        print("Installed core info; native binaries unchanged")
+        return
     audit = {}
     for core in DIRECTORIES:
         for target, (_, machine) in TARGETS.items():
@@ -190,6 +214,7 @@ def main():
                 "sha256": audit[f"{core}/{target}"]["sha256"],
             }
         catalog[core]["downloads"] = downloads
+    install_core_info(args.romm, catalog)
     catalog_path.write_text(json.dumps(catalog, indent=2) + "\n")
     (args.artifacts.parent / "artifact-audit.json").write_text(
         json.dumps(audit, indent=2) + "\n"
