@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { connect } from "node:net";
 import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import { createHash } from "node:crypto";
 import { inflateSync } from "node:zlib";
 import { WebSocket } from "ws";
@@ -10,6 +11,7 @@ import {
   CMD,
   Decoder,
   MAGIC,
+  MAX_STATE,
   crc32,
   fixedString,
   infoPayload,
@@ -276,6 +278,562 @@ async function native(room, options = {}) {
   return { socket, queue, sync };
 }
 
+const preparedManifest = {
+  ...manifest,
+  romId: 11,
+  owner: "host",
+  manualStart: true,
+  nativeAllowed: true,
+  nativeAuth: true,
+  cartridges: [0, 1].map(() => ({
+    romId: 11,
+    sha256: "a".repeat(64),
+    size: 32768,
+    crc32: manifest.contentCrc,
+  })),
+};
+
+test("native authority starts two RetroArch clients without a web core and transfers hosting", async (t) => {
+  const f = await fixture(t);
+  const settings = {
+    ...preparedManifest,
+    system: "gba",
+    coreName: "mGBA Splitscreen",
+    coreVersion: "test",
+    stateSize: 1,
+    maxPrediction: 12,
+    collectCartridges: true,
+    nativeAuthority: true,
+  };
+  const { data: room } = await f.api("/v1/rooms", settings);
+  const stored = f.bridge.rooms.get(room.id);
+  const host = await f.web(room.hostPath);
+  const { data: joined } = await f.api(`/v1/rooms/${room.id}/join`, {
+    owner: "guest",
+    romId: 11,
+    cartridge: settings.cartridges[1],
+  });
+  await f.web(joined.peerPath);
+  async function control(owner, message) {
+    const result = await f.api(`/v1/rooms/${room.id}/control`, {
+      owner,
+      ...message,
+    });
+    assert.equal(result.status, 200, JSON.stringify(result.data));
+    return result.data;
+  }
+  await control("host", { t: "assign", player: 0, seat: 0 });
+  await control("guest", { t: "assign", player: 1, seat: 1 });
+  const preparations = [];
+  for (const [player, owner] of ["host", "guest"].entries()) {
+    const result = await f.api(`/v1/rooms/${room.id}/native`, {
+      owner,
+      romId: 11,
+      clientPlatform: "windows-x86_64",
+      cartridge: settings.cartridges[player],
+      battery: Buffer.from([player + 1]).toString("base64"),
+    });
+    assert.equal(result.status, 201, JSON.stringify(result.data));
+    preparations.push(result.data);
+  }
+  assert.notEqual(host.ws.readyState, WebSocket.OPEN);
+  assert.equal(stored.peers.size, 0);
+  assert.equal(stored.closed, false);
+  assert.equal(stored.host, 0);
+  assert.equal(stored.metadata().canStart, true);
+  assert.equal(
+    (
+      await f.api(`/v1/rooms/${room.id}/control`, {
+        owner: "guest",
+        t: "start-request",
+      })
+    ).status,
+    409,
+  );
+  await control("host", { t: "start-request" });
+  assert.equal(stored.contentPrepared, true);
+  const launched = await f.api(
+    `/v1/rooms/${room.id}/native/${preparations[0].credential}`,
+  );
+  assert.equal(launched.data.pending, false);
+  assert.deepEqual(launched.data.initialBatteries, ["AQ==", "Ag=="]);
+  const clients = [];
+  for (const preparation of preparations) {
+    const client = await native(
+      { ...room, password: preparation.nativePassword },
+      { manifest: settings },
+    );
+    t.after(() => client.socket.destroy());
+    client.socket.setNoDelay(true);
+    client.socket.write(packet(CMD.PLAY, words(0)));
+    assert.equal((await client.queue.next()).command, CMD.INPUT);
+    clients.push(client);
+  }
+  assert.equal(stored.state, null);
+  assert.equal((await clients[0].queue.next()).command, CMD.REQUEST_STATE);
+  for (let i = 0; i < 2; i++)
+    assert.equal((await clients[0].queue.next()).command, CMD.INPUT);
+  const seed = Buffer.alloc(128, 42);
+  clients[0].socket.write(
+    packet(CMD.LOAD_STATE, statePayload(3, seed, 7, false)),
+  );
+  for (const client of clients) {
+    let frame;
+    do frame = await client.queue.next();
+    while (frame.command === CMD.MODE);
+    assert.equal(frame.command, CMD.INPUT);
+    const f0 = frame.payload.readUInt32BE(0);
+    client.socket.write(
+      Buffer.concat([
+        packet(CMD.INPUT, words(f0, 1, 0)),
+        packet(CMD.INPUT, words(f0 + 1, 1, 0)),
+      ]),
+    );
+  }
+  for (const client of clients) {
+    const load = await client.queue.next();
+    assert.equal(load.command, CMD.LOAD_STATE);
+    assert.deepEqual(readStatePayload(load.payload, 7, false, 128).state, seed);
+    assert.equal((await client.queue.next()).command, CMD.STALL);
+  }
+  assert.equal(stored.manifest.stateSize, 128);
+  assert.equal(stored.running, true);
+  assert.equal(stored.host, 0);
+  async function nativeMessage(client, command) {
+    for (;;) {
+      const message = await client.queue.next();
+      assert.notEqual(message.command, CMD.NAK);
+      if (message.command === command) return message;
+    }
+  }
+  for (let frame = 1; frame <= 90; frame++) {
+    for (const [player, client] of clients.entries()) {
+      client.socket.write(
+        Buffer.concat([
+          packet(
+            CMD.INPUT,
+            words(stored.peers.get(player).frameOffset + frame, 1, player + 1),
+          ),
+          packet(CMD.PING),
+        ]),
+      );
+      await nativeMessage(client, CMD.PONG);
+    }
+  }
+  assert.equal(stored.progress, 90);
+  assert(stored.peers.get(1).playing);
+  const authority = stored.peers.get(0);
+  authority.requestCheckpoint();
+  await nativeMessage(clients[0], CMD.REQUEST_STATE);
+  clients[0].socket.write(
+    packet(
+      CMD.LOAD_STATE,
+      statePayload(authority.frameOffset + 90, seed, 7, false),
+    ),
+  );
+  const check = await nativeMessage(clients[1], CMD.CRC);
+  assert.deepEqual(
+    check.payload,
+    words(stored.peers.get(1).frameOffset + 90, crc32(seed)),
+  );
+  await f.api(`/v1/rooms/${room.id}/leave`, { owner: "host" });
+  assert.equal(stored.host, 1);
+  assert.equal(stored.progress, 90);
+  const guest = await f.api(`/v1/rooms/${room.id}/join`, {
+    owner: "browser",
+    romId: 11,
+    cartridge: settings.cartridges[0],
+  });
+  const web = await f.web(guest.data.peerPath);
+  await control("browser", { t: "assign", player: 0, seat: 0 });
+  web.send({ t: "game-open", generation: stored.generation });
+  web.send({
+    t: "content-ready",
+    generation: stored.generation,
+    size: 128,
+    contentCrc: settings.contentCrc,
+    resume: true,
+  });
+  await nativeMessage(clients[1], CMD.REQUEST_STATE);
+  clients[1].socket.write(
+    packet(
+      CMD.LOAD_STATE,
+      statePayload(stored.peers.get(1).frameOffset + 90, seed, 7, false),
+    ),
+  );
+  let resumed;
+  do resumed = await web.queue.next();
+  while (resumed.t !== "resume");
+  assert.equal(resumed.f, 90);
+  assert.equal(stored.host, 1);
+  await f.api(`/v1/rooms/${room.id}/leave`, { owner: "guest" });
+  assert.equal(stored.host, 0);
+  assert.equal(stored.peers.get(0).kind, "web");
+  assert.equal(stored.running, true);
+});
+
+test("cancelling or expiring the preferred native reservation restores the web host", async (t) => {
+  const f = await fixture(t);
+  const { data: room } = await f.api("/v1/rooms", {
+    ...preparedManifest,
+    nativeAuthority: true,
+    maxPrediction: 12,
+  });
+  const stored = f.bridge.rooms.get(room.id);
+  await f.web(room.hostPath);
+  for (const cancel of [true, false]) {
+    const { data: reservation, status } = await f.api(
+      `/v1/rooms/${room.id}/native`,
+      {
+        owner: "native",
+        romId: 11,
+        battery: "",
+        clientPlatform: "windows-x86_64",
+      },
+    );
+    assert.equal(status, 201, JSON.stringify(reservation));
+    assert.equal(stored.host, 1);
+    if (cancel) {
+      const response = await f.api(
+        `/v1/rooms/${room.id}/native/${reservation.credential}`,
+        undefined,
+        "DELETE",
+      );
+      assert.equal(response.status, 200);
+    } else {
+      stored.reservations.get(1).until = Date.now() - 1;
+      stored.expireReservations();
+    }
+    assert.equal(stored.host, 0);
+    assert.equal(stored.manifest.owner, "host");
+  }
+});
+
+test("a native guest becomes the mixed room's initial state authority", async (t) => {
+  const f = await fixture(t);
+  const settings = {
+    ...preparedManifest,
+    nativeAuthority: true,
+    maxPrediction: 12,
+  };
+  const { data: room } = await f.api("/v1/rooms", settings);
+  const stored = f.bridge.rooms.get(room.id);
+  const web = await f.web(room.hostPath);
+  const preparation = await f.api(`/v1/rooms/${room.id}/native`, {
+    owner: "native",
+    romId: 11,
+    battery: "Ag==",
+    clientPlatform: "windows-x86_64",
+  });
+  assert.equal(preparation.status, 201);
+  const client = await native(
+    { ...room, password: preparation.data.nativePassword },
+    { manifest: settings },
+  );
+  t.after(() => client.socket.destroy());
+  client.socket.write(packet(CMD.PLAY, words(0)));
+  assert.equal((await client.queue.next()).command, CMD.INPUT);
+  assert.equal(stored.host, 1);
+  assert.equal(stored.state, null);
+  for (const player of [0, 1]) {
+    const result = await f.api(`/v1/rooms/${room.id}/control`, {
+      owner: "native",
+      t: "assign",
+      player,
+      seat: player,
+    });
+    assert.equal(result.status, 200);
+  }
+  assert.equal(
+    (
+      await f.api(`/v1/rooms/${room.id}/control`, {
+        owner: "host",
+        t: "start-request",
+      })
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await f.api(`/v1/rooms/${room.id}/control`, {
+        owner: "native",
+        t: "start-request",
+      })
+    ).status,
+    200,
+  );
+  assert.equal((await client.queue.next()).command, CMD.REQUEST_STATE);
+  for (let n = 0; n < 2; n++)
+    assert.equal((await client.queue.next()).command, CMD.INPUT);
+  const state = Buffer.alloc(128, 17);
+  client.socket.write(packet(CMD.LOAD_STATE, statePayload(3, state, 7, false)));
+  let prepare;
+  do prepare = await web.queue.next();
+  while (prepare.t !== "prepare");
+  assert.equal(prepare.nativeState, true);
+  assert.equal(prepare.host, 1);
+  const transfer = await web.queue.next();
+  assert.equal(transfer.t, "state");
+  assert.deepEqual(await web.queue.next(), state);
+  web.send({
+    t: "ready",
+    revision: transfer.revision,
+    generation: stored.generation,
+  });
+  let input;
+  do input = await client.queue.next();
+  while (input.command === CMD.MODE);
+  assert.equal(input.command, CMD.INPUT);
+  const frame = input.payload.readUInt32BE(0);
+  client.socket.write(
+    Buffer.concat([
+      packet(CMD.INPUT, words(frame, 1, 0)),
+      packet(CMD.INPUT, words(frame + 1, 1, 0)),
+    ]),
+  );
+  assert.equal((await client.queue.next()).command, CMD.LOAD_STATE);
+  assert.equal((await client.queue.next()).command, CMD.STALL);
+  let start;
+  do start = await web.queue.next();
+  while (start.t !== "start");
+  assert.equal(stored.running, true);
+  assert.equal(stored.host, 1);
+  assert.equal(stored.saveHost(), 0);
+});
+
+test("Windows handoff retains the account, member count and chosen seat", async (t) => {
+  const f = await fixture(t);
+  const { data: room } = await f.api("/v1/rooms", preparedManifest);
+  await f.web(room.hostPath);
+  const { data: joined } = await f.api(`/v1/rooms/${room.id}/join`, {
+    owner: "guest",
+    romId: 11,
+  });
+  const guest = await f.web(joined.peerPath);
+  const stored = f.bridge.rooms.get(room.id);
+  stored.seats = [0, 1];
+  stored.state = Buffer.alloc(128);
+  const response = await f.api(`/v1/rooms/${room.id}/native`, {
+    owner: "guest",
+    romId: 11,
+    nickname: "Guest",
+    clientPlatform: "windows-x86_64",
+    battery: "AQID",
+  });
+  assert.equal(response.status, 201);
+  assert.equal(response.data.player, joined.player);
+  const prepared = stored.metadata();
+  assert.equal(prepared.current, 2);
+  assert.deepEqual(prepared.seats, [0, 1]);
+  assert.equal(
+    prepared.members.filter((member) => member.owner === "guest").length,
+    1,
+  );
+  assert.equal(
+    prepared.members.find((member) => member.owner === "guest").kind,
+    "preparing",
+  );
+  let event;
+  do {
+    event = await guest.queue.next();
+  } while (event.t !== "handoff");
+  const duplicate = await f.api(`/v1/rooms/${room.id}/join`, {
+    owner: "guest",
+    romId: 11,
+  });
+  assert.equal(duplicate.status, 409);
+  const desktop = await native({
+    ...room,
+    password: response.data.nativePassword,
+  });
+  t.after(() => desktop.socket.destroy());
+  const member = stored
+    .metadata()
+    .members.find((item) => item.owner === "guest");
+  assert.equal(member.kind, "native");
+  assert.equal(member.clientPlatform, "windows-x86_64");
+  assert.equal(stored.metadata().current, 2);
+  assert.deepEqual(
+    stored.peers.get(joined.player).initialBattery,
+    Buffer.from([1, 2, 3]),
+  );
+  assert.equal(stored.reservations.size, 0);
+  assert.equal(stored.admitNative({ salt: 1 }, Buffer.alloc(64, 48)), false);
+});
+
+test("retained room controls survive launcher cancellation, expiry and native exit", async (t) => {
+  const f = await fixture(t);
+  const { data: room } = await f.api("/v1/rooms", preparedManifest);
+  await f.web(room.hostPath);
+  const { data: joined } = await f.api(`/v1/rooms/${room.id}/join`, {
+    owner: "guest",
+    romId: 11,
+  });
+  const guest = await f.web(joined.peerPath + "&retainRoom=1&manualJoin=1");
+  const stored = f.bridge.rooms.get(room.id);
+  const original = stored.peers.get(1);
+  stored.seats = [0, 1];
+  stored.state = Buffer.alloc(128);
+  async function message(type) {
+    for (;;) {
+      const value = await guest.queue.next();
+      if (value.t === type) return value;
+      assert.notEqual(value.t, "disconnect");
+    }
+  }
+  const prepare = async () => {
+    const result = await f.api(`/v1/rooms/${room.id}/native`, {
+      owner: "guest",
+      romId: 11,
+      clientPlatform: "windows-x86_64",
+      battery: "AQID",
+    });
+    assert.equal(result.status, 201);
+    assert.equal((await message("handoff")).retainRoom, true);
+    assert.equal(stored.controllers.get(1), original);
+    assert.equal(guest.ws.readyState, WebSocket.OPEN);
+    assert.equal(stored.metadata().current, 2);
+    assert.equal(
+      stored.members().filter((member) => member.owner === "guest").length,
+      1,
+    );
+    return result.data;
+  };
+  for (const action of ["cancel", "expire", "disconnect"]) {
+    const prepared = await prepare();
+    if (action === "cancel") {
+      assert.equal(
+        (
+          await f.api(
+            `/v1/rooms/${room.id}/native/${prepared.credential}`,
+            undefined,
+            "DELETE",
+          )
+        ).status,
+        200,
+      );
+    } else if (action === "expire") {
+      stored.reservations.get(1).until = Date.now() - 1;
+      stored.expireReservations();
+    } else {
+      const desktop = await native({
+        ...room,
+        password: prepared.nativePassword,
+      });
+      desktop.socket.destroy();
+    }
+    await message("returned");
+    assert.equal(stored.peers.get(1), original);
+    assert.equal(stored.controllers.size, 0);
+    assert.equal(stored.metadata().current, 2);
+    assert.deepEqual(stored.seats, [0, 1]);
+    assert.equal(stored.members()[1].ready, false);
+    assert.equal(stored.closed, false);
+    assert.equal(guest.ws.readyState, WebSocket.OPEN);
+  }
+  const prepared = await prepare();
+  const desktop = await native({ ...room, password: prepared.nativePassword });
+  const closed = once(guest.ws, "close");
+  await f.api(`/v1/rooms/${room.id}/leave`, { owner: "guest" });
+  await closed;
+  for (let n = 0; stored.peers.has(1) && n < 100; n++) await delay(5);
+  assert.equal(stored.peers.has(1), false);
+  assert.equal(stored.controllers.size, 0);
+  assert.equal(stored.reservations.size, 0);
+  assert.equal(stored.members().length, 1);
+  assert.equal(stored.closed, false);
+  desktop.socket.destroy();
+});
+
+test("closing the retained room page revokes an unfinished Windows launch", async (t) => {
+  const f = await fixture(t);
+  const { data: room } = await f.api("/v1/rooms", {
+    ...preparedManifest,
+    nativeAuthority: true,
+    maxPrediction: 12,
+  });
+  const browser = await f.web(room.hostPath + "&retainRoom=1&manualJoin=1");
+  const stored = f.bridge.rooms.get(room.id);
+  const result = await f.api(`/v1/rooms/${room.id}/native`, {
+    owner: "host",
+    romId: 11,
+    clientPlatform: "windows-x86_64",
+  });
+  assert.equal(result.status, 201);
+  browser.ws.close();
+  for (let n = 0; !stored.closed && n < 100; n++) await delay(5);
+  assert.equal(stored.closed, true);
+  assert.equal(stored.controllers.size, 0);
+  assert.equal(stored.reservations.size, 0);
+});
+
+test("host handoff elects a browser host and maps wire client zero separately", async (t) => {
+  const f = await fixture(t);
+  const { data: room } = await f.api("/v1/rooms", preparedManifest);
+  await f.web(room.hostPath);
+  const rejected = await f.api(`/v1/rooms/${room.id}/native`, {
+    owner: "host",
+    romId: 11,
+    clientPlatform: "windows-x86_64",
+  });
+  assert.equal(rejected.status, 409);
+  const { data: joined } = await f.api(`/v1/rooms/${room.id}/join`, {
+    owner: "guest",
+    romId: 11,
+  });
+  await f.web(joined.peerPath);
+  const stored = f.bridge.rooms.get(room.id);
+  stored.seats = [0, 1];
+  stored.state = Buffer.alloc(128);
+  const { data: preparation } = await f.api(`/v1/rooms/${room.id}/native`, {
+    owner: "host",
+    romId: 11,
+    clientPlatform: "windows-x86_64",
+  });
+  assert.equal(preparation.player, 0);
+  assert.equal(stored.host, 1);
+  const desktop = await native({
+    ...room,
+    password: preparation.nativePassword,
+  });
+  t.after(() => desktop.socket.destroy());
+  const peer = stored.peers.get(0);
+  assert.equal(peer.wirePlayer(0), 1);
+  assert.equal(peer.wirePlayer(1), 0);
+  assert.equal(stored.metadata().current, 2);
+  assert.deepEqual(stored.seats, [0, 1]);
+  peer.sendInput(0, 0, 7);
+  assert.equal((await desktop.queue.next()).payload.readUInt32BE(4), 1);
+});
+
+test("native preparation can select a free seat and its launch credential still expires", async (t) => {
+  const f = await fixture(t);
+  const { data: room } = await f.api("/v1/rooms", {
+    ...preparedManifest,
+    system: "gba",
+    coreName: "mGBA Splitscreen",
+    cartridges: [
+      preparedManifest.cartridges[0],
+      { ...preparedManifest.cartridges[1], romId: 12 },
+    ],
+  });
+  await f.web(room.hostPath);
+  const { data: pending } = await f.api(`/v1/rooms/${room.id}/native`, {
+    owner: "guest",
+    romId: 12,
+    clientPlatform: "windows-x86_64",
+  });
+  const endpoint = `/v1/rooms/${room.id}/native/${pending.credential}`;
+  assert.equal((await f.api(endpoint, { seat: 0 }, "PATCH")).status, 200);
+  assert.equal((await f.api(endpoint, { seat: 1 }, "PATCH")).status, 200);
+  const stored = f.bridge.rooms.get(room.id);
+  stored.reservations.get(pending.player).until = 0;
+  stored.probePeers();
+  assert.equal(stored.metadata().current, 1);
+  assert.equal(stored.seats[pending.player], null);
+  assert.equal((await f.api(endpoint)).status, 404);
+});
+
 test("native clients wait for the browser's initial state and SRAM", async (t) => {
   const f = await fixture(t);
   const { data: room } = await f.api("/v1/rooms", {
@@ -321,6 +879,54 @@ test("native clients wait for the browser's initial state and SRAM", async (t) =
   stored.probePeers();
   assert.equal((await desktop.queue.next()).command, CMD.PING);
 });
+
+test(
+  "native lobby sends idle frames beyond RetroArch's ten-second stall limit",
+  { timeout: 18000 },
+  async (t) => {
+    const f = await fixture(t);
+    const { data: room } = await f.api("/v1/rooms", {
+      ...manifest,
+      manualStart: true,
+      nativeAllowed: true,
+      maxPrediction: 12,
+    });
+    const host = await f.web(room.hostPath);
+    host.ws.on("message", (bytes, binary) => {
+      if (binary) return;
+      const message = JSON.parse(bytes);
+      if (message.t === "ping") host.send({ t: "pong", nonce: message.nonce });
+    });
+    host.send({ t: "state", f: 0, size: 128, sram: "" });
+    host.ws.send(Buffer.alloc(128, 17));
+    let ready;
+    do {
+      ready = await host.queue.next();
+    } while (ready.t !== "state-ready");
+    host.send({ t: "ready", revision: ready.revision });
+    const desktop = await native(room);
+    t.after(() => desktop.socket.destroy());
+    desktop.socket.write(packet(CMD.PLAY, words(0)));
+    const began = performance.now();
+    let frame = 0;
+    while (frame < 7) {
+      const message = await desktop.queue.next();
+      if (message.command === CMD.PING) {
+        desktop.socket.write(packet(CMD.PONG));
+        continue;
+      }
+      assert.equal(message.command, CMD.INPUT);
+      assert.deepEqual(message.payload, words(frame++, 0, 0));
+    }
+    assert(performance.now() - began > 10000);
+    const stored = f.bridge.rooms.get(room.id);
+    assert.notEqual(stored.running, true);
+    assert.equal(stored.started, false);
+    assert.deepEqual(stored.seats, [null, null]);
+    assert.equal(stored.peers.get(1).nextFrame, 0);
+    assert.equal(desktop.socket.destroyed, false);
+  },
+);
 
 test("CRC32 and protocol-7 core-state blocks follow native byte order", () => {
   assert.equal(crc32(Buffer.from("123456789")), 0xcbf43926);
@@ -494,6 +1100,262 @@ for (const protocol of [5, 6, 7])
     assert.deepEqual(await host.queue.next(), { t: "pause", paused: false });
   });
 
+test("web host progress paces an ahead native peer over the existing TCP connection", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const entries = [];
+  const f = await fixture(t, { logger: (entry) => entries.push(entry) });
+  const { data: room } = await f.api("/v1/rooms", {
+    ...manifest,
+    maxPrediction: 12,
+    nativeAllowed: true,
+  });
+  const host = await f.web(room.hostPath);
+  await initial(host);
+  const client = await native(room);
+  t.after(() => client.socket.destroy());
+  client.socket.setNoDelay(true);
+  client.socket.write(packet(CMD.PLAY, words(0)));
+  assert.equal((await client.queue.next()).command, CMD.MODE);
+  assert.equal((await client.queue.next()).command, CMD.INPUT);
+  client.socket.write(
+    Buffer.concat([
+      packet(CMD.INPUT, words(0, 1, 0)),
+      packet(CMD.INPUT, words(1, 1, 0)),
+    ]),
+  );
+  assert.equal((await client.queue.next()).command, CMD.LOAD_STATE);
+  assert.equal((await client.queue.next()).command, CMD.STALL);
+  assert.equal((await host.queue.next()).t, "start");
+  host.send({ t: "input", f: 0, b: 0 });
+  host.send({ t: "progress", f: 1, confirmed: 1 });
+  assert.equal((await client.queue.next()).command, CMD.INPUT);
+  const pong = once(host.ws, "pong");
+  host.ws.ping();
+  await pong;
+  // Advance both protocol peers without running an emulator. PONG barriers
+  // make the cross-socket input/confirmation order deterministic.
+  for (let frame = 1; frame <= 120; frame++) {
+    client.socket.write(
+      Buffer.concat([
+        packet(CMD.INPUT, words(frame + 1, 1, frame)),
+        packet(CMD.PING),
+      ]),
+    );
+    assert.equal((await client.queue.next()).command, CMD.PONG);
+    host.send({ t: "input", f: frame, b: 256 });
+    host.send({ t: "progress", f: frame + 1, confirmed: frame + 1 });
+    assert.deepEqual(
+      (await client.queue.next()).payload,
+      words(frame + 1, 0, 256),
+    );
+  }
+  now = 2000;
+  client.socket.write(
+    Buffer.concat([
+      ...Array.from({ length: 8 }, (_, i) =>
+        packet(CMD.INPUT, words(122 + i, 1, 32)),
+      ),
+      packet(CMD.PING),
+    ]),
+  );
+  assert.equal((await client.queue.next()).command, CMD.PONG);
+  host.send({ t: "progress", f: 121, confirmed: 121 });
+  const correction = await client.queue.next();
+  assert.equal(correction.command, CMD.STALL);
+  assert.deepEqual(correction.payload, words(6));
+  const paced = entries.filter((entry) => entry.event === "native-paced");
+  assert.equal(paced.length, 1);
+  assert.equal(paced[0].leadFrames, 8);
+  assert.equal(paced[0].stallFrames, 6);
+  assert(f.bridge.rooms.get(room.id).running);
+  host.send({ t: "input", f: 121, b: 128 });
+  assert.deepEqual((await client.queue.next()).payload, words(122, 0, 128));
+  client.socket.write(packet(CMD.INPUT, words(130, 1, 64)));
+  let last;
+  do last = await host.queue.next();
+  while (last.t === "input" && last.f < 129);
+  assert.deepEqual(last, { t: "input", f: 129, b: 64, player: 1 });
+});
+
+test("a waiting native rejoin isolates pause and checkpoints until the new game starts", async (t) => {
+  const entries = [];
+  const f = await fixture(t, { logger: (entry) => entries.push(entry) });
+  const { data: room } = await f.api("/v1/rooms", {
+    ...preparedManifest,
+    maxPrediction: 12,
+  });
+  const host = await f.web(room.hostPath);
+  const stored = f.bridge.rooms.get(room.id);
+  const pauses = [];
+  host.ws.on("message", (bytes, binary) => {
+    if (binary) return;
+    const message = JSON.parse(bytes.toString());
+    if (message.t === "pause") pauses.push(message.paused);
+  });
+  const send = (message) =>
+    host.send({ ...message, generation: stored.generation });
+  async function webBarrier() {
+    const pong = once(host.ws, "pong");
+    host.ws.ping();
+    await pong;
+  }
+  async function ignoreNativePause(desktop) {
+    const count = pauses.length;
+    const paused = stored.paused;
+    desktop.socket.write(
+      Buffer.concat([
+        packet(CMD.PAUSE, fixedString("Desktop")),
+        packet(CMD.RESUME),
+        packet(CMD.PING),
+      ]),
+    );
+    assert.equal((await desktop.queue.next()).command, CMD.PONG);
+    await webBarrier();
+    assert.equal(pauses.length, count);
+    assert.equal(stored.paused, paused);
+  }
+  async function webMessage(type) {
+    for (;;) {
+      const message = await host.queue.next();
+      assert.notEqual(message.t, "disconnect", message.message);
+      if (message.t === type) return message;
+    }
+  }
+  async function uploadState() {
+    send({
+      t: "state",
+      f: 0,
+      size: 128,
+      sram: "",
+      ...(stored.pendingBatteries.has(1) ? { batteryPlayer: 1 } : {}),
+    });
+    host.ws.send(Buffer.alloc(128, 17));
+    const ready = await webMessage("state-ready");
+    send({ t: "ready", revision: ready.revision });
+  }
+  async function connectNative() {
+    const { status, data: prepared } = await f.api(
+      `/v1/rooms/${room.id}/native`,
+      {
+        owner: "guest",
+        romId: 11,
+        clientPlatform: "windows-x86_64",
+      },
+    );
+    assert.equal(status, 201);
+    const desktop = await native({
+      ...room,
+      password: prepared.nativePassword,
+    });
+    t.after(() => desktop.socket.destroy());
+    desktop.socket.setNoDelay(true);
+    desktop.socket.write(packet(CMD.PLAY, words(0)));
+    assert.equal((await desktop.queue.next()).command, CMD.INPUT);
+    return desktop;
+  }
+  async function startGame(desktop) {
+    send({ t: "assign", player: 0, seat: 0 });
+    send({ t: "assign", player: 1, seat: 1 });
+    send({ t: "start-request" });
+    await webMessage("prepare");
+    if (stored.hadGame) {
+      const count = pauses.length;
+      send({ t: "pause", paused: true });
+      send({ t: "pause", paused: false });
+      await webBarrier();
+      assert.equal(stored.closed, false);
+      assert.equal(pauses.length, count);
+      await ignoreNativePause(desktop);
+    }
+    await uploadState();
+    let bootstrap;
+    do bootstrap = await desktop.queue.next();
+    while (bootstrap.command === CMD.MODE);
+    assert.equal(bootstrap.command, CMD.INPUT);
+    const frame = bootstrap.payload.readUInt32BE(0);
+    await ignoreNativePause(desktop);
+    desktop.socket.write(
+      Buffer.concat([
+        packet(CMD.INPUT, words(frame, 1, 0)),
+        packet(CMD.INPUT, words(frame + 1, 1, 0)),
+      ]),
+    );
+    const load = await desktop.queue.next();
+    assert.equal(load.command, CMD.LOAD_STATE);
+    assert.deepEqual(
+      readStatePayload(load.payload, 7, false, 128).state,
+      stored.state,
+    );
+    assert.equal((await desktop.queue.next()).command, CMD.STALL);
+    await webMessage("start");
+    assert(stored.peers.get(1).playing);
+  }
+  await uploadState();
+  const first = await connectNative();
+  await startGame(first);
+  assert.equal(
+    (await f.api(`/v1/rooms/${room.id}/leave`, { owner: "guest" })).status,
+    200,
+  );
+  assert.equal(stored.peers.size, 1);
+  assert(stored.running);
+  const desktop = await connectNative();
+  const waiting = stored.peers.get(1);
+  assert.equal(waiting.playing, false);
+  const generation = stored.generation;
+  // Twenty checkpoints exceed the 16-entry native verification window. The
+  // browser keeps playing while the reconnected native client waits in the lobby.
+  for (let frame = 0; frame < 1200; frame++) {
+    send({ t: "input", f: frame, b: 0 });
+    send({ t: "progress", f: frame + 1, confirmed: frame + 1 });
+    if ((frame + 1) % 60 === 0) send({ t: "crc", f: frame + 1, crc: 123 });
+  }
+  for (
+    let i = 0;
+    i < 300 && !stored.closed && stored.latestCheckpoint < 1200;
+    i++
+  )
+    await delay(5);
+  assert.equal(
+    stored.closed,
+    false,
+    entries.find((entry) => entry.event === "room-closed")?.reason,
+  );
+  assert.equal(stored.latestCheckpoint, 1200);
+  assert.equal(stored.generation, generation);
+  assert.equal(waiting.pendingChecks.size, 0);
+  assert.equal(waiting.checksSent, 0);
+  assert.equal(waiting.lastReportedFrame, 0);
+  waiting.keepLobbyAlive();
+  assert.equal((await desktop.queue.next()).command, CMD.INPUT);
+  assert.equal(desktop.queue.values.length, 0);
+  await ignoreNativePause(desktop);
+  send({ t: "pause", paused: true });
+  assert.equal((await webMessage("pause")).paused, true);
+  await ignoreNativePause(desktop);
+  send({ t: "pause", paused: false });
+  assert.equal((await webMessage("pause")).paused, false);
+  assert.equal(desktop.queue.values.length, 0);
+  await startGame(desktop);
+  desktop.socket.write(packet(CMD.PAUSE, fixedString("Desktop")));
+  assert.equal((await webMessage("pause")).paused, true);
+  desktop.socket.write(packet(CMD.RESUME));
+  assert.equal((await webMessage("pause")).paused, false);
+  const offset = waiting.frameOffset;
+  send({ t: "input", f: 0, b: 128 });
+  send({ t: "progress", f: 1, confirmed: 1 });
+  send({ t: "crc", f: 1, crc: 456 });
+  assert.deepEqual((await desktop.queue.next()).payload, words(offset, 0, 128));
+  desktop.socket.write(packet(CMD.INPUT, words(offset + 1, 1, 32)));
+  const check = await desktop.queue.next();
+  assert.equal(check.command, CMD.CRC);
+  assert.deepEqual(check.payload, words(offset + 1, 456));
+  assert.equal(waiting.checksSent, 1);
+  assert.equal(waiting.pendingChecks.size, 0);
+  assert(stored.running);
+});
+
 test("a web-only room never allocates a native listener", async (t) => {
   const f = await fixture(t);
   const { data: room } = await f.api("/v1/rooms", manifest);
@@ -654,5 +1516,31 @@ test("native state parsing rejects malformed envelopes and wrong raw sizes", () 
   assert.throws(
     () => readStatePayload(statePayload(2, state, 5, false), 5, false, 127),
     /size/,
+  );
+  for (const protocol of [5, 7])
+    for (const compressed of [false, true])
+      assert.deepEqual(
+        readStatePayload(
+          statePayload(2, state, protocol, compressed),
+          protocol,
+          compressed,
+        ),
+        { frame: 2, state },
+      );
+  const oversized = words(0, MAX_STATE + 65537);
+  assert.throws(() => readStatePayload(oversized, 7, true), /size/);
+  assert.throws(
+    () =>
+      readStatePayload(statePayload(0, Buffer.alloc(0), 7, false), 7, false),
+    /block/,
+  );
+  assert.throws(
+    () =>
+      readStatePayload(
+        statePayload(2, state, 7, false).subarray(0, -1),
+        7,
+        false,
+      ),
+    /Truncated/,
   );
 });

@@ -167,14 +167,22 @@ export class Decoder {
 export function readStatePayload(payload, protocol, compressed, expectedSize) {
   if (payload.length < 8) throw new Error("Truncated native state");
   const size = payload.readUInt32BE(4);
-  if (size < expectedSize || size > expectedSize + 65536)
+  if (
+    size < 1 ||
+    size > MAX_STATE + 65536 ||
+    (expectedSize !== undefined &&
+      (size < expectedSize || size > expectedSize + 65536))
+  )
     throw new Error("Unexpected native state size");
   const state = compressed
     ? inflateSync(payload.subarray(8), { maxOutputLength: size })
     : payload.subarray(8);
   if (state.length !== size) throw new Error("Truncated native state data");
   if (protocol < 7 || state.subarray(0, 7).toString() !== "NETPLAY") {
-    if (state.length !== expectedSize)
+    if (
+      state.length > MAX_STATE ||
+      (expectedSize !== undefined && state.length !== expectedSize)
+    )
       throw new Error("Unexpected raw core state size");
     return { frame: payload.readUInt32BE(0), state: Buffer.from(state) };
   }
@@ -193,7 +201,12 @@ export function readStatePayload(payload, protocol, compressed, expectedSize) {
       break;
     }
     if (kind === "MEM ") {
-      if (core || length !== expectedSize)
+      if (
+        core ||
+        !length ||
+        length > MAX_STATE ||
+        (expectedSize !== undefined && length !== expectedSize)
+      )
         throw new Error("Invalid native core state block");
       core = Buffer.from(state.subarray(offset, offset + length));
     }

@@ -1,4 +1,5 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import { passwordMatches } from "./native-launch.mjs";
 import {
   CMD,
   Decoder,
@@ -14,6 +15,15 @@ import {
   syncPayload,
   words,
 } from "./wire.mjs";
+
+// Keep a small input lead without letting a faster frontend run away. RetroArch
+// accepts at most 60 requested stall frames and spaces server requests by 120
+// frames. Also bound wall time so a burst of web progress cannot stack requests.
+const PACING_LEAD = 3;
+const PACING_TARGET = 2;
+const PACING_INTERVAL_FRAMES = 120;
+const PACING_INTERVAL_MS = 2000;
+const PACING_MAX_STALL = 60;
 
 export class NativePeer {
   constructor(room, socket, player) {
@@ -41,8 +51,13 @@ export class NativePeer {
     this.checksSent = 0;
     this.buttons = 0;
     this.serverFrame = 0;
+    this.lobbyFrames = 0;
     this.playing = false;
-    this.salt = room.password ? randomBytes(4).readUInt32BE() || 1 : 0;
+    this.pacing = null;
+    this.salt =
+      room.password || room.manifest.nativeAuth
+        ? randomBytes(4).readUInt32BE() || 1
+        : 0;
     this.decoder = new Decoder(
       (header) => this.header(header),
       (command, data) => this.command(command, data),
@@ -64,12 +79,18 @@ export class NativePeer {
       this.drop("Native connection failed", { code: error.code }),
     );
     socket.on("close", () => {
+      room.pendingNative?.delete(this);
       clearTimeout(this.timeout);
       this.log("native-closed", {
         reason: this.closeReason ?? "Peer closed the connection",
         durationMs: Date.now() - this.connectedAt,
         receivedBytes: socket.bytesRead,
         sentBytes: socket.bytesWritten,
+        ready: this.ready,
+        playing: this.playing,
+        lobbyFrames: this.lobbyFrames,
+        serverFrame: this.serverFrame,
+        lastReportedFrame: this.lastReportedFrame,
       });
       room.depart(this, "Native peer disconnected");
     });
@@ -138,18 +159,10 @@ export class NativePeer {
     if (this.phase === "password") {
       if (command !== CMD.PASSWORD || data.length !== 64)
         throw new Error("Expected RetroArch password");
-      const salt = this.salt.toString(16).toUpperCase().padStart(8, "0");
-      const expected = Buffer.from(
-        createHash("sha256")
-          .update(salt + this.room.password)
-          .digest("hex")
-          .toUpperCase(),
-      );
       if (
-        !timingSafeEqual(
-          Buffer.from(data.toString("ascii").toUpperCase()),
-          expected,
-        )
+        !(this.room.manifest.nativeAuth
+          ? this.room.admitNative(this, data)
+          : passwordMatches(this.salt, this.room.password, data))
       )
         throw new Error("Incorrect room password");
       this.send(CMD.INFO, infoPayload(this.room.manifest));
@@ -195,8 +208,10 @@ export class NativePeer {
         this.ready = true;
         this.log("native-ready");
         if (this.room.manifest.manualStart) clearTimeout(this.timeout);
+        this.keepLobbyAlive();
         this.room.lobby();
         this.room.maybeStart();
+        this.room.resumeGame?.(this);
         return;
       case CMD.INPUT:
         if (this.restarting) {
@@ -232,12 +247,39 @@ export class NativePeer {
           throw new Error("Invalid native joypad input");
         return;
       case CMD.LOAD_STATE: {
+        if (this.checkpointRequested) {
+          this.checkpointRequested = false;
+          clearTimeout(this.checkpointTimeout);
+          const { frame, state } = readStatePayload(
+            data,
+            this.protocol,
+            this.compressed,
+            this.room.manifest.stateSize,
+          );
+          this.room.nativeCheckpoint(this, frame - this.frameOffset, state);
+          return;
+        }
+        if (this.resumeSourceId) {
+          const id = this.resumeSourceId;
+          this.resumeSourceId = null;
+          const { frame, state } = readStatePayload(
+            data,
+            this.protocol,
+            this.compressed,
+            this.room.manifest.stateSize,
+          );
+          this.room.completeResume(this, id, frame - this.frameOffset, state);
+          return;
+        }
         if (this.restartSourceRequested) {
           const { state } = readStatePayload(
             data,
             this.protocol,
             this.compressed,
-            this.room.manifest.stateSize,
+            this.room.manifest.stateSize === 1 &&
+              this.room.manifest.nativeAuthority
+              ? undefined
+              : this.room.manifest.stateSize,
           );
           this.restartSourceRequested = false;
           clearTimeout(this.sourceTimeout);
@@ -257,14 +299,17 @@ export class NativePeer {
           this.room.manifest.stateSize,
         );
         const stage = this.calibrationSamples;
-        if (frame !== stage + 1)
+        if (frame !== this.startFrame + stage + 1)
           throw new Error("Native calibration state is out of order");
         this.calibrationSamples++;
         this.room.sendCalibration(this, stage, state);
         if (stage === 0) {
           this.send(CMD.REQUEST_STATE);
           for (const peer of this.room.peers.values())
-            this.send(CMD.INPUT, words(1, peer.player, 0));
+            this.send(
+              CMD.INPUT,
+              words(this.startFrame + 1, this.wirePlayer(peer.player), 0),
+            );
         } else {
           this.bootstrapping = false;
           this.bootstrapped = true;
@@ -273,6 +318,7 @@ export class NativePeer {
       }
       case CMD.REQUEST_STATE:
         if (data.length) throw new Error("Invalid state request");
+        if (this.room.manifest.nativeAuthority && !this.playing) return;
         if (!this.bootstrapping) this.room.requestState(this);
         return;
       case CMD.PING:
@@ -313,16 +359,30 @@ export class NativePeer {
     }
   }
 
+  wirePlayer(player) {
+    if (this.player !== 0 || !this.serverPlayer) return player;
+    if (player === 0) return this.serverPlayer;
+    return player === this.serverPlayer ? 0 : player;
+  }
+
   sync() {
-    if (this.phase !== "waiting-state" || !this.room.state) return;
+    if (
+      this.phase !== "waiting-state" ||
+      (!this.room.state && !this.room.manifest.nativeAuthority)
+    )
+      return;
+    // RetroArch reserves wire client zero for the server, independently of room membership.
+    this.serverPlayer = this.player === 0 ? 1 : 0;
     this.send(
       CMD.SYNC,
       syncPayload(
         this.room.manifest,
-        this.player,
+        this.wirePlayer(this.player),
         this.nickname,
-        this.room.sram,
-        this.room.seats[0] ?? 0,
+        this.room.manifest.nativeAuthority && !this.room.hadGame
+          ? Buffer.alloc(0)
+          : this.room.sram,
+        this.room.seats[this.serverPlayer] ?? 0,
       ),
     );
     if (this.protocol >= 6) {
@@ -333,13 +393,35 @@ export class NativePeer {
     this.log("native-synced", { sramBytes: this.room.sram.length });
   }
 
+  keepLobbyAlive() {
+    if (
+      !this.room.manifest.manualStart ||
+      this.phase !== "connected" ||
+      !this.ready ||
+      this.playing ||
+      this.bootstrapping
+    )
+      return;
+    // RetroArch spectators time out after ten seconds without input frames.
+    this.send(CMD.INPUT, words(this.serverFrame, 0, 0));
+    this.lobbyFrames++;
+  }
+
   start() {
     if (this.restarting) {
       this.bootstrapped = true;
       return;
     }
     this.bootstrapping = true;
+    this.startFrame = this.serverFrame;
+    this.frameOffset = this.startFrame + (this.calibration ? 2 : 1);
+    this.nextWireFrame = this.startFrame;
     this.wireSeats = this.room.seats.slice();
+    this.log("native-start", {
+      wireFrame: this.startFrame,
+      frameOffset: this.frameOffset,
+      lobbyFrames: this.lobbyFrames,
+    });
     if (this.room.manifest.manualStart) {
       this.timeout = setTimeout(
         () => this.drop("Native startup timed out"),
@@ -353,22 +435,26 @@ export class NativePeer {
       this.send(
         CMD.MODE,
         modePayload(
-          0,
-          peer.player,
+          this.startFrame,
+          this.wirePlayer(peer.player),
           peer.nickname,
           peer === this,
           peer.slave,
-          this.room.seats[peer.player],
+          (this.room.gameSeats ?? this.room.seats)[peer.player],
         ),
       );
     }
     for (const peer of this.room.peers.values())
       if (peer !== this || this.slave)
-        this.send(CMD.INPUT, words(0, peer.player, 0));
+        this.send(
+          CMD.INPUT,
+          words(this.startFrame, this.wirePlayer(peer.player), 0),
+        );
   }
 
   finishStart() {
     clearTimeout(this.timeout);
+    this.pacing = null;
     if (this.restarting) {
       this.finishRestart();
       return;
@@ -379,8 +465,15 @@ export class NativePeer {
   }
 
   requestRestartSource() {
+    if (this.checkpointRequested || this.resumeSourceId)
+      throw new Error("The host is synchronizing. Try starting again shortly.");
+    if (this.restartSourceRequested) return;
     this.restartSourceRequested = true;
     this.send(CMD.REQUEST_STATE);
+    if (!this.playing) {
+      this.keepLobbyAlive();
+      this.keepLobbyAlive();
+    }
     this.sourceTimeout = setTimeout(() => {
       this.restartSourceRequested = false;
       this.room.starting = false;
@@ -393,6 +486,26 @@ export class NativePeer {
     this.sourceTimeout.unref();
   }
 
+  requestResumeSource(id) {
+    this.resumeSourceId = id;
+    this.send(CMD.REQUEST_STATE);
+  }
+
+  requestCheckpoint() {
+    if (
+      this.checkpointRequested ||
+      this.restartSourceRequested ||
+      this.resumeSourceId
+    )
+      return;
+    this.checkpointRequested = true;
+    this.send(CMD.REQUEST_STATE);
+    this.checkpointTimeout = setTimeout(() => {
+      this.log("native-checkpoint-timeout");
+    }, 10000);
+    this.checkpointTimeout.unref();
+  }
+
   prepareRestart() {
     this.restarting = true;
     this.restartReady = false;
@@ -400,9 +513,10 @@ export class NativePeer {
     this.nativeInputsReady = false;
     this.pendingInputs.length = 0;
     this.pendingChecks.clear();
-    // RetroArch 1.22.2 can retain remote_paused after RESUME. A bounded stall
-    // drains old input without entering that persistent pause state.
-    this.send(CMD.STALL, words(60));
+    // Drain old input through an ordered PING/PONG barrier. Do not stall:
+    // loading a future state puts RetroArch at load_frame - 1 and relies on
+    // its post-frame advance. A stall skips that advance and resumes the
+    // existing peer one emulated frame ahead of newly connected clients.
     this.send(CMD.PING);
     this.timeout = setTimeout(
       () => this.drop("Native restart timed out"),
@@ -416,16 +530,24 @@ export class NativePeer {
     for (let frame = this.serverFrame; frame < base; frame++)
       this.send(CMD.NOINPUT, words(frame));
     for (let player = 0; player < this.room.manifest.players; player++) {
-      const seat = this.room.seats[player];
+      const seat = (this.room.gameSeats ?? this.room.seats)[player];
       if (player === this.player || this.wireSeats[player] === seat) continue;
       const nickname = this.room.peers.get(player)?.nickname ?? "Empty";
-      const removed = modePayload(base, player, nickname, false, false, seat);
-      removed.writeUInt32BE(player, 4);
+      const wirePlayer = this.wirePlayer(player);
+      const removed = modePayload(
+        base,
+        wirePlayer,
+        nickname,
+        false,
+        false,
+        seat,
+      );
+      removed.writeUInt32BE(wirePlayer, 4);
       removed.writeUInt32BE(0, 8);
       this.send(CMD.MODE, removed);
       this.send(
         CMD.MODE,
-        modePayload(base, player, nickname, false, false, seat),
+        modePayload(base, wirePlayer, nickname, false, false, seat),
       );
     }
     this.wireSeats = this.room.seats.slice();
@@ -434,7 +556,6 @@ export class NativePeer {
     this.nextFrame = 0;
     this.restarting = false;
     this.sendState(0, this.room.state);
-    this.send(CMD.STALL, words(1));
   }
 
   receiveInput(data) {
@@ -471,8 +592,59 @@ export class NativePeer {
     this.pendingInputs.length = 0;
   }
 
+  pace(host, now = performance.now()) {
+    if (
+      !this.room.running ||
+      this.room.paused ||
+      this.slave ||
+      !this.playing ||
+      !this.nativeInputsReady ||
+      this.bootstrapping ||
+      this.restarting ||
+      this.phase !== "connected" ||
+      this.socket.destroyed ||
+      (host?.kind !== "web" &&
+        !(this.room.manifest.nativeAuthority && host?.kind === "native")) ||
+      host === this ||
+      !host.playing ||
+      host.player !== this.room.host ||
+      this.room.peers.get(host.player) !== host
+    ) {
+      this.pacing = null;
+      return;
+    }
+    if (this.pacing?.host !== host || host.frame < this.pacing.frame) {
+      // Allow startup or a new host to settle before making a correction.
+      this.pacing = { host, frame: host.frame, at: now };
+      return;
+    }
+    const lead = this.nextFrame - host.frame;
+    if (
+      lead <= PACING_LEAD ||
+      host.frame - this.pacing.frame < PACING_INTERVAL_FRAMES ||
+      now - this.pacing.at < PACING_INTERVAL_MS
+    )
+      return;
+    const frames = Math.min(PACING_MAX_STALL, lead - PACING_TARGET);
+    this.pacing.frame = host.frame;
+    this.pacing.at = now;
+    // Pause execution, not the input stream: frame offsets and state/checksum
+    // identities must remain unchanged throughout the current game.
+    this.send(CMD.STALL, words(frames));
+    this.log("native-paced", {
+      hostPlayer: host.player,
+      hostFrame: host.frame,
+      nativeFrame: this.nextFrame,
+      leadFrames: lead,
+      stallFrames: frames,
+    });
+  }
+
   sendInput(frame, player, buttons) {
-    this.send(CMD.INPUT, words(frame + this.frameOffset, player, buttons));
+    this.send(
+      CMD.INPUT,
+      words(frame + this.frameOffset, this.wirePlayer(player), buttons),
+    );
   }
 
   sendCrc(frame, crc) {
@@ -522,6 +694,7 @@ export class NativePeer {
   close() {
     clearTimeout(this.timeout);
     clearTimeout(this.sourceTimeout);
+    clearTimeout(this.checkpointTimeout);
     this.socket.destroy();
   }
 }

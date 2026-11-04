@@ -121,6 +121,195 @@ class Socket extends EventTarget {
   }
 }
 
+test("web uses a native host snapshot and catches up with at most one muted frame per tick", () => {
+  const core = new Core();
+  core.profile = { memoryIds: [0, 1] };
+  const socket = new Socket();
+  const link = new BridgeConnection(core, socket, {
+    player: 0,
+    players: 2,
+    maxPrediction: 12,
+    battery: Uint8Array.of(9),
+  });
+  const receive = (packet) =>
+    link.receive(JSON.stringify({ generation: link.generation, ...packet }));
+  receive({
+    t: "joined",
+    player: 0,
+    players: 2,
+    manualStart: true,
+    nativeAuthority: true,
+    host: 1,
+  });
+  assert.equal(JSON.parse(socket.sent[0]).battery, "CQ==");
+  socket.sent.length = 0;
+  receive({
+    t: "prepare",
+    generation: 1,
+    host: 1,
+    seats: [0, 1],
+    nativeState: true,
+  });
+  assert.equal(
+    socket.sent.length,
+    0,
+    "Web must not replace the native snapshot or its cartridge saves",
+  );
+  const state = new Core();
+  state.values[1] = 42;
+  receive({ t: "state", f: 0, size: core.size, revision: 1 });
+  link.receive(state.save().buffer);
+  assert.deepEqual(core.save(), state.save());
+  receive({ t: "start", f: 0, player: 0, players: 2, maxPrediction: 12 });
+  for (let f = 0; f < 15; f++) receive({ t: "input", player: 1, f, b: 0 });
+  const presentations = [];
+  core.stepPlayers = (buttons, present) => presentations.push(present);
+  receive({ t: "clock", host: 1, f: 6, generation: 0 });
+  receive({ t: "clock", host: 0, f: 6 });
+  assert.equal(link.hostFrame, null);
+  receive({ t: "clock", host: 1, f: 6 });
+  assert(link.tick(1));
+  assert.equal(link.session.frame, 2);
+  assert.deepEqual(presentations, [false, true]);
+  receive({ t: "lobby", host: 0, running: true, seats: [0, 1] });
+  assert.equal(
+    link.hostFrame,
+    null,
+    "A departed host's clock must not keep accelerating the replacement",
+  );
+  assert(link.tick(1));
+  assert.equal(link.session.frame, 3);
+  receive({ t: "clock", host: 0, f: 50 });
+  assert.equal(
+    link.hostFrame,
+    null,
+    "The host must not chase its own relayed clock",
+  );
+  link.hostFrame = 100;
+  link.closeGame();
+  assert.equal(
+    link.hostFrame,
+    null,
+    "Closing a game must discard its old clock",
+  );
+  link.stop();
+});
+
+test("pause messages during restart preparation do not disconnect the web player", () => {
+  const core = new Core();
+  core.profile = { memoryIds: [0, 1] };
+  const link = new BridgeConnection(core, new Socket(), {
+    player: 0,
+    players: 2,
+  });
+  const receive = (packet) =>
+    link.receive(JSON.stringify({ generation: link.generation, ...packet }));
+  receive({ t: "joined", player: 0, players: 2, manualStart: true });
+  const start = { t: "start", f: 0, player: 0, players: 2 };
+  receive(start);
+  receive({ t: "pause", paused: true });
+  assert.equal(link.session.paused, true);
+  receive({ t: "prepare", generation: 1, host: 0, seats: [0, 1] });
+  assert.equal(link.session, null);
+  assert.equal(link.preparing, true);
+  for (const paused of [false, true, false])
+    assert.doesNotThrow(() => receive({ t: "pause", paused }));
+  assert.equal(link.preparing, true);
+  assert.equal(link.closed, false);
+  assert.throws(
+    () => receive({ t: "pause", paused: "false" }),
+    /Invalid relay pause command/,
+  );
+  receive(start);
+  receive({ t: "input", player: 1, f: 0, b: 128 });
+  assert.equal(link.tick(0), true);
+  receive({ t: "pause", paused: true });
+  assert.equal(link.tick(0), false);
+  receive({ t: "pause", paused: false });
+  receive({ t: "input", player: 1, f: 1, b: 128 });
+  assert.equal(link.tick(0), true);
+  assert.equal(core.values[0], 2);
+});
+
+test("manual game entry defers web content until Join, independently of seat selection", async () => {
+  const socket = new Socket();
+  const core = new Core();
+  core.profile = { memoryIds: [0, 1] };
+  let boots = 0;
+  const link = new BridgeConnection(null, socket, {
+    player: 1,
+    players: 2,
+    manualJoin: true,
+    onContent: async () => {
+      boots++;
+      return core;
+    },
+  });
+  link.receive(
+    JSON.stringify({
+      t: "joined",
+      player: 1,
+      players: 2,
+      manualStart: true,
+      manualJoin: true,
+      running: true,
+    }),
+  );
+  const content = JSON.stringify({ t: "content", contentCrc: 123 });
+  link.receive(content);
+  link.assignPlayer(1, 1);
+  await new Promise(setImmediate);
+  assert.equal(boots, 0);
+  assert.equal(link.started, false);
+  assert.deepEqual(socket.sent.map(JSON.parse), [
+    { t: "assign", player: 1, seat: 1, generation: 0 },
+  ]);
+  link.openGame();
+  assert.equal(JSON.parse(socket.sent.at(-1)).t, "game-open");
+  link.receive(content);
+  await new Promise(setImmediate);
+  assert.equal(boots, 1);
+  assert.equal(link.started, false);
+  assert.equal(JSON.parse(socket.sent.at(-1)).t, "content-ready");
+  assert.equal(JSON.parse(socket.sent.at(-1)).resume, true);
+});
+
+test("a retained Windows handoff keeps room control and requires an explicit game join on return", () => {
+  const socket = new Socket();
+  const status = [];
+  const link = new BridgeConnection(null, socket, {
+    player: 1,
+    players: 2,
+    manualJoin: true,
+    onStatus: (value) => status.push(value),
+  });
+  const receive = (packet) => link.receive(JSON.stringify(packet));
+  receive({ t: "joined", player: 1, players: 2, manualStart: true });
+  receive({ t: "handoff", retainRoom: true });
+  assert.equal(socket.readyState, 1);
+  assert.equal(link.closed, false);
+  assert.equal(link.nativeMode, true);
+  assert.equal(link.gameClosed, true);
+  receive({ t: "lobby", host: 1, generation: 3, running: true, seats: [0, 1] });
+  receive({ t: "ping", nonce: "alive" });
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)), {
+    t: "pong",
+    nonce: "alive",
+    generation: 3,
+  });
+  receive({ t: "returned", generation: 3 });
+  assert.equal(link.nativeMode, false);
+  assert.equal(link.gameClosed, true);
+  assert.equal(link.joinRequested, false);
+  assert.equal(link.adapter, null);
+  assert.equal(status.at(-1), "game-closed");
+  link.openGame();
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)), {
+    t: "game-open",
+    generation: 3,
+  });
+});
+
 test("guest loads initial state and acknowledges its exact revision before starting", () => {
   const core = new Core();
   const socket = new Socket();
@@ -139,6 +328,26 @@ test("guest loads initial state and acknowledges its exact revision before start
   assert.ok(link.session);
   link.stop();
   assert.ok(link.session.stopped);
+});
+
+test("a fresh linked participant clears the previous occupant's cartridge save", () => {
+  const core = new Core();
+  core.profile = { core: "mgba_splitscreen", memoryIds: [0, 256] };
+  const memories = [
+    new Uint8Array(512).fill(255),
+    new Uint8Array(512).fill(255),
+  ];
+  core.memory = (id) => memories[id === 256 ? 1 : 0];
+  core.loadMemory = (id, data) => core.memory(id).set(data);
+  const link = new BridgeConnection(core, new Socket(), {
+    player: 0,
+    players: 2,
+  });
+  memories[1].fill(7);
+  link.receive(JSON.stringify({ t: "battery", player: 1, size: 0 }));
+  link.receive(new ArrayBuffer(0));
+  assert(memories[1].every((value) => value === 255));
+  link.stop();
 });
 
 test("initial transfer cannot overwrite an active session", () => {
@@ -293,6 +502,51 @@ function predictedSession({ core = new ReplayCore(), maxPrediction = 4 } = {}) {
   session.start();
   return { session, core, packets };
 }
+
+test("a surviving web host accepts its live snapshot back during automatic native admission", () => {
+  const adapter = new ReplayCore();
+  adapter.profile = { memoryIds: [0, 1] };
+  const socket = new Socket();
+  const link = new BridgeConnection(adapter, socket, { player: 0, players: 2 });
+  link.receive(
+    JSON.stringify({
+      t: "joined",
+      manualStart: true,
+      player: 0,
+      players: 2,
+      host: 0,
+    }),
+  );
+  adapter.stepPlayers([5, 7]);
+  const live = adapter.save().slice();
+  link.receive(
+    JSON.stringify({
+      t: "prepare",
+      host: 0,
+      seats: [0, 1],
+      generation: 1,
+      nativeState: true,
+    }),
+  );
+  link.receive(
+    JSON.stringify({ t: "state", f: 0, size: adapter.size, revision: 4 }),
+  );
+  link.receive(live);
+  assert.deepEqual(adapter.save(), live);
+  assert(
+    socket.sent
+      .filter((packet) => typeof packet === "string")
+      .map(JSON.parse)
+      .some((packet) => packet.t === "ready" && packet.revision === 4),
+  );
+  assert.throws(
+    () =>
+      link.receive(
+        JSON.stringify({ t: "state", f: 0, size: adapter.size, revision: 5 }),
+      ),
+    /Incompatible/,
+  );
+});
 
 test("late input restores the original frame and replays without presenting or resending", () => {
   const { session, core, packets } = predictedSession();

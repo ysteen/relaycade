@@ -12,6 +12,18 @@ assert.ok(
   "Usage: node scripts/sync-romm-client.mjs <RomM checkout> [--check]",
 );
 const hashes = {};
+const launcher = await readFile(resolve(root, "client/windows-session.ps1"));
+const launcherTarget = resolve(
+  destination,
+  "custom-emulatorjs/input-netplay/windows-session.ps1",
+);
+if (check)
+  assert.deepEqual(
+    await readFile(launcherTarget),
+    launcher,
+    "Windows launcher drift",
+  );
+else await writeFile(launcherTarget, launcher);
 for (const name of [
   "bridge-session.js",
   "bridge-calibration.js",
