@@ -3,6 +3,7 @@
 !package-lock.json
 !server.mjs
 !native.mjs
+!native-launch.mjs
 !wire.mjs
 !LICENSE
 !NOTICE
