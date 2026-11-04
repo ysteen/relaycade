@@ -97,8 +97,49 @@ static void sequence(int incorrect) {
         step(incorrect ? 0 : (frame % 29 < 6 ? 256 : 0), frame % 37 < 8 ? 16 : 0);
     }
 }
+#ifdef PROBE_GBA
+static void verify_save_startup(const void *rom, size_t rom_size) {
+    for (unsigned players = 2; players <= 4; players++) {
+        require(probe_init(rom, rom_size, players), "Could not load startup cartridges");
+        unsigned char *saves[4];
+        const size_t save_size = 128 * 1024;
+        for (unsigned slot = 0; slot < players; slot++) {
+            unsigned id = slot ? 0xff + slot : RETRO_MEMORY_SAVE_RAM;
+            if (players == 3)
+                require(probe_memory_size(id) == save_size, "SRAM size unavailable before first frame");
+            saves[slot] = (unsigned char *)probe_memory(id);
+            require(saves[slot] != NULL, "SRAM unavailable before first frame");
+            require(probe_memory_size(id) == save_size, "Invalid startup SRAM size");
+            for (size_t offset = 0; offset < save_size; offset++)
+                require(saves[slot][offset] == 0xff, "Fresh cartridge reused a save");
+            memset(saves[slot], 0x31 + slot, save_size);
+        }
+        size_t size = probe_size();
+        require(size > 0 && size <= 16 * 1024 * 1024, "Invalid startup state size");
+        void *state = malloc(size);
+        require(state && probe_save(state, size), "Could not capture seeded initial state");
+        for (unsigned slot = 0; slot < players; slot++) memset(saves[slot], 0, save_size);
+        require(probe_load(state, size), "Could not restore seeded initial state");
+        for (unsigned slot = 0; slot < players; slot++) {
+            for (size_t offset = 0; offset < save_size; offset++)
+                require(saves[slot][offset] == 0x31 + slot, "Initial state lost a cartridge save");
+        }
+        free(state);
+        probe_close();
+    }
+    puts("{\"saveStartup\":true,\"players\":[2,3,4],\"frames\":0,\"initialStatePreservesSaves\":true}");
+}
+#endif
 int main(int argc, char **argv) {
-    require(argc >= 3, "Usage: probe CORE info | CORE ROM OUTPUT_PREFIX [INITIAL_STATE]");
+    require(argc >= 3, "Usage: probe CORE info | CORE ROM OUTPUT_PREFIX [INITIAL_STATE|-] [SECOND_ROM]");
+#ifdef _WIN32
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    limits.ProcessMemoryLimit = (SIZE_T)1024 * 1024 * 1024;
+    require(job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) &&
+        AssignProcessToJobObject(job, GetCurrentProcess()) && SetProcessAffinityMask(GetCurrentProcess(), 3), "Could not bound Windows qualification resources");
+#endif
     void *library = OPEN(argv[1]);
     require(library != NULL, "Could not load core library");
 #define LOAD(name, result, args) p_##name = (result (*) args) SYMBOL(library, #name); require(p_##name != NULL, "Missing " #name);
@@ -113,7 +154,17 @@ int main(int argc, char **argv) {
     size_t rom_size;
     void *rom = read_bytes(argv[2], &rom_size);
 #ifdef PROBE_GBA
-    require(probe_init(rom, rom_size, 2), "Could not load test cartridge");
+    if (!strcmp(argv[3], "save-startup")) {
+        verify_save_startup(rom, rom_size);
+        free(rom);
+        return 0;
+    }
+    if (argc > 5) {
+        size_t second_size;
+        void *second = read_bytes(argv[5], &second_size);
+        require(probe_init_pair(rom, rom_size, second, second_size), "Could not load distinct test cartridges");
+        free(second);
+    } else require(probe_init(rom, rom_size, 2), "Could not load test cartridge");
 #else
     require(probe_init(rom, rom_size), "Could not load test cartridge");
 #endif
@@ -122,7 +173,7 @@ int main(int argc, char **argv) {
     require(size > 0 && size <= 16 * 1024 * 1024, "Invalid state size");
     void *initial = calloc(1, size), *expected = calloc(1, size), *replayed = calloc(1, size);
     require(initial && expected && replayed, "Out of memory");
-    if (argc > 4) {
+    if (argc > 4 && strcmp(argv[4], "-")) {
         size_t supplied_size;
         void *supplied = read_bytes(argv[4], &supplied_size);
         require(supplied_size == size && probe_load(supplied, size), "Cross-platform state rejected");
@@ -138,6 +189,11 @@ int main(int argc, char **argv) {
     require(probe_save(replayed, size) && !memcmp(expected, replayed, size), "Rollback state mismatch");
     write_bytes(argv[3], "initial", initial, size);
     write_bytes(argv[3], "final", expected, size);
+#ifdef PROBE_GBA
+    write_bytes(argv[3], "sram-p1", (void *)probe_memory(0), probe_memory_size(0));
+    write_bytes(argv[3], "sram-p2", (void *)probe_memory(256), probe_memory_size(256));
+    write_bytes(argv[3], "video", captured_video, captured_video_size);
+#endif
     printf("{\"core\":\"%s\",\"version\":\"%s\",\"stateSize\":%zu,\"frames\":120,\"rollback\":true}\n", info.library_name, info.library_version, size);
     probe_close();
     free(initial); free(expected); free(replayed); free(rom);

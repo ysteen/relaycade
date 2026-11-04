@@ -4,6 +4,8 @@
 #include <string.h>
 
 static unsigned buttons[4], player_count;
+static unsigned char captured_video[480 * 480 * 4];
+static size_t captured_video_size;
 static bool environment(unsigned command, void *data) {
     if (command == RETRO_ENVIRONMENT_GET_VARIABLE) {
         struct retro_variable *var = data;
@@ -31,13 +33,18 @@ static bool environment(unsigned command, void *data) {
         || command == RETRO_ENVIRONMENT_SET_GEOMETRY || command == RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO
         || command == RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO;
 }
-static void video(const void *data, unsigned width, unsigned height, size_t pitch) {}
+static void video(const void *data, unsigned width, unsigned height, size_t pitch) {
+    if (data && pitch * height <= sizeof(captured_video)) {
+        captured_video_size = pitch * height;
+        memcpy(captured_video, data, captured_video_size);
+    }
+}
 static size_t audio(const int16_t *data, size_t frames) { return frames; }
 static void poll(void) {}
 static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id) {
     return port < player_count && id < 16 && (buttons[port] & (1u << id)) != 0;
 }
-int probe_init(const void *rom, size_t size, unsigned players) {
+static int probe_setup(unsigned players) {
     if (players < 2 || players > 4) return false;
     player_count = players;
     retro_set_environment(environment);
@@ -46,6 +53,17 @@ int probe_init(const void *rom, size_t size, unsigned players) {
     retro_set_input_poll(poll);
     retro_set_input_state(input);
     retro_init();
+    return true;
+}
+int probe_init_pair(const void *first, size_t first_size, const void *second, size_t second_size) {
+    if (!probe_setup(2)) return false;
+    struct retro_game_info games[2] = {
+        {NULL, first, first_size, NULL}, {NULL, second, second_size, NULL}
+    };
+    return retro_load_game_special(0x201, games, 2);
+}
+int probe_init(const void *rom, size_t size, unsigned players) {
+    if (!probe_setup(players)) return false;
     struct retro_game_info games[4];
     for (unsigned i = 0; i < players; i++) games[i] = (struct retro_game_info){NULL, rom, size, NULL};
     return retro_load_game_special(0x1ff + players, games, players);

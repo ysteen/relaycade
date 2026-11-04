@@ -22,7 +22,7 @@ TARGETS = {
 }
 DIRECTORIES = {
     "sameboy": "sameboy-sbr2",
-    "mgba_splitscreen": "mgba-spst4",
+    "mgba_splitscreen": "mgba-spst4-multi",
     "snes9x": "snes9x-2d4cce69",
 }
 CORE_INFO = Path(__file__).resolve().parents[1] / "core-info"
@@ -173,6 +173,8 @@ def main():
         default=ROOT
         / ".cache/native-toolchains/llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64/bin/llvm-readobj",
     )
+    parser.add_argument("--cores", nargs="+", choices=list(DIRECTORIES), default=list(DIRECTORIES))
+    parser.add_argument("--targets", nargs="+", choices=list(TARGETS), default=list(TARGETS))
     args = parser.parse_args()
     catalog_path = args.romm / "custom-emulatorjs/input-netplay/bridge-cores.json"
     catalog = json.loads(catalog_path.read_text())
@@ -182,13 +184,24 @@ def main():
         print("Installed core info; native binaries unchanged")
         return
     audit = {}
-    for core in DIRECTORIES:
-        for target, (_, machine) in TARGETS.items():
+    for core in args.cores:
+        for target in args.targets:
+            _, machine = TARGETS[target]
             source = args.artifacts / core / target
             manifest = json.loads((source / "manifest.json").read_text())
             assert manifest["target"] == target
             assert manifest["version"] == catalog[core]["native"]["coreVersion"]
             if core == "mgba_splitscreen":
+                multi_rom_patch = CORE_INFO.parent / "patches/mgba-multi-rom.patch"
+                assert manifest.get("orderedCartridges") is True
+                assert manifest.get("multiRomPatchSha256") == hashlib.sha256(multi_rom_patch.read_bytes()).hexdigest()
+                save_init_patch = CORE_INFO.parent / "patches/mgba-native-save-init.patch"
+                assert manifest.get("saveMemoryInitialization") == "before-first-frame-v1"
+                assert manifest.get("saveInitPatchSha256") == hashlib.sha256(save_init_patch.read_bytes()).hexdigest()
+                if target.startswith("windows-"):
+                    view_patch = CORE_INFO.parent / "patches/mgba-local-player-view.patch"
+                    assert manifest.get("localPlayerView") == "netplay-mode-file-v1"
+                    assert manifest.get("localPlayerViewPatchSha256") == hashlib.sha256(view_patch.read_bytes()).hexdigest()
                 startup_patch = CORE_INFO.parent / "patches/mgba-native-startup.patch"
                 assert (
                     manifest.get("startupPatchSha256")
@@ -200,13 +213,20 @@ def main():
             result = inspect(source / filename, target, machine, args.llvm)
             assert result["sha256"] == manifest["sha256"][filename]
             audit[f"{core}/{target}"] = result
-    for core, folder in DIRECTORIES.items():
+    for core in args.cores:
+        folder = DIRECTORIES[core]
         destination = (
             args.romm / "custom-emulatorjs/data/cores/compat/rollback" / folder
         )
         if core == "mgba_splitscreen":
             shutil.copy2(
                 CORE_INFO.parent / "patches/mgba-native-startup.patch", destination
+            )
+            shutil.copy2(
+                CORE_INFO.parent / "patches/mgba-native-save-init.patch", destination
+            )
+            shutil.copy2(
+                CORE_INFO.parent / "patches/mgba-local-player-view.patch", destination
             )
         downloads = {
             "linux-x86_64": {
@@ -217,7 +237,8 @@ def main():
                 ).hexdigest(),
             }
         }
-        for target, (label, _) in TARGETS.items():
+        for target in args.targets:
+            label, _ = TARGETS[target]
             source = args.artifacts / core / target
             shutil.copytree(source, destination / "native" / target, dirs_exist_ok=True)
             filename = f"{core}_libretro." + (

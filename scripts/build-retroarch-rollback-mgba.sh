@@ -11,6 +11,8 @@ COMPAT_ARCHIVE="${COMPAT_ARCHIVE:-$TASK_ROOT/result/netplay-interop/stock-core/d
 COMPAT_FRONTEND="${COMPAT_FRONTEND:-$TASK_ROOT/build/compile/retroarch-netplay}"
 COMPAT_PATCH="$COMPAT_REPO/patches/mgba-rollback-state.patch"
 COMPAT_STARTUP_PATCH="$COMPAT_REPO/patches/mgba-native-startup.patch"
+COMPAT_SAVE_INIT_PATCH="$COMPAT_REPO/patches/mgba-native-save-init.patch"
+COMPAT_MULTI_ROM_PATCH="$COMPAT_REPO/patches/mgba-multi-rom.patch"
 COMPAT_PROBE="$COMPAT_REPO/test/mgba-core-probe.c"
 if [[ -e "$COMPAT_WORK" ]]; then
   printf 'Refusing to reuse existing work directory: %s\n' "$COMPAT_WORK" >&2
@@ -22,8 +24,10 @@ mkdir -p -- "$COMPAT_WORK/native-source" "$COMPAT_WORK/wasm-source"
 for kind in native wasm; do
   tar -xzf "$COMPAT_ARCHIVE" --strip-components=1 -C "$COMPAT_WORK/$kind-source"
   patch -d "$COMPAT_WORK/$kind-source" -p1 --input "$COMPAT_PATCH"
+  patch -d "$COMPAT_WORK/$kind-source" -p1 --input "$COMPAT_MULTI_ROM_PATCH"
 done
 patch -d "$COMPAT_WORK/native-source" -p1 --input "$COMPAT_STARTUP_PATCH"
+patch -d "$COMPAT_WORK/native-source" -p1 --input "$COMPAT_SAVE_INIT_PATCH"
 python3 - "$COMPAT_WORK/wasm-source/CMakeLists.txt" <<'PY'
 from pathlib import Path
 import sys
@@ -52,7 +56,7 @@ cmake --build "$COMPAT_WORK/wasm" --target mgba_splitscreen_libretro -j2
 emcc "$COMPAT_PROBE" "$COMPAT_WORK/wasm/mgba_splitscreen_libretro.a" \
   -I "$COMPAT_WORK/wasm-source/src/platform/libretro" -O2 -sMODULARIZE=1 -sEXPORT_ES6=1 \
   -sENVIRONMENT=node,web -sALLOW_MEMORY_GROWTH=1 \
-  -sEXPORTED_FUNCTIONS='["_malloc","_free","_probe_init","_probe_step","_probe_size","_probe_save","_probe_load","_probe_close","_probe_memory","_probe_memory_size"]' \
+  -sEXPORTED_FUNCTIONS='["_malloc","_free","_probe_init","_probe_init_pair","_probe_step","_probe_size","_probe_save","_probe_load","_probe_close","_probe_memory","_probe_memory_size"]' \
   -o "$COMPAT_WORK/core-probe.mjs"
 if [[ "${COMPAT_BUILD_WEB:-0}" == 1 ]]; then
   python3 - "$COMPAT_FRONTEND" "$COMPAT_WORK/frontend" <<'PY'
@@ -84,7 +88,7 @@ import json, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 core = {'name': 'mgba_splitscreen', 'extensions': ['gba'], 'options': {}, 'save': 'srm', 'repo': 'https://github.com/Spuds0588/mgba-splitscreen'}
-build = {'minimumEJSVersion': '4.3.0', 'version': 'mgba-f1d5975-rollback1', 'stateProfile': 'SPST4', 'stockCore': False, 'frontendInputs': 4}
+build = {'minimumEJSVersion': '4.3.0', 'version': 'mgba-f1d5975-rollback2', 'stateProfile': 'SPST4', 'stockCore': False, 'frontendInputs': 4, 'orderedCartridges': True}
 for name, value in [('core.json', core), ('build.json', build)]:
     (out / name).write_text(json.dumps(value) + '\n')
 PY
@@ -93,16 +97,20 @@ PY
     7z a -t7z -mx=7 mgba_splitscreen-wasm.data mgba_link_libretro.js mgba_link_libretro.wasm core.json build.json license.txt
   )
 fi
-python3 - "$COMPAT_WORK" "$COMPAT_PATCH" "$COMPAT_STARTUP_PATCH" <<'PY'
+python3 - "$COMPAT_WORK" "$COMPAT_PATCH" "$COMPAT_STARTUP_PATCH" "$COMPAT_MULTI_ROM_PATCH" "$COMPAT_SAVE_INIT_PATCH" <<'PY'
 from pathlib import Path
 import hashlib, json, sys
-root, patch, startup_patch = map(Path, sys.argv[1:])
+root, patch, startup_patch, multi_rom_patch, save_init_patch = map(Path, sys.argv[1:])
 paths = ['native/mgba_splitscreen_libretro.so', 'native-probe.so', 'wasm/mgba_splitscreen_libretro.a', 'core-probe.mjs', 'core-probe.wasm']
 paths += [str(p.relative_to(root)) for p in (root / 'web').glob('*')] if (root / 'web').exists() else []
-manifest = {'core': 'mGBA Splitscreen', 'version': '0.1.0-f1d5975-rollback1', 'stateProfile': 'SPST4',
+manifest = {'core': 'mGBA Splitscreen', 'version': '0.1.0-f1d5975-rollback2', 'stateProfile': 'SPST4',
             'sourceRevision': 'f1d5975d77285f77affbfe64b7050ebd5c4b6a77',
             'patchSha256': hashlib.sha256(patch.read_bytes()).hexdigest(),
             'startupPatchSha256': hashlib.sha256(startup_patch.read_bytes()).hexdigest(),
+            'saveInitPatchSha256': hashlib.sha256(save_init_patch.read_bytes()).hexdigest(),
+            'saveMemoryInitialization': 'before-first-frame-v1',
+            'multiRomPatchSha256': hashlib.sha256(multi_rom_patch.read_bytes()).hexdigest(),
+            'orderedCartridges': True,
             'nativeStartup': 'configured-players-v1',
             'sha256': {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths}}
 (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -33,7 +33,7 @@ CORES = {
     },
     "mgba_splitscreen": {
         "name": "mGBA Splitscreen",
-        "version": "0.1.0-f1d5975-rollback1",
+        "version": "0.1.0-f1d5975-rollback2",
         "revision": "f1d5975d77285f77affbfe64b7050ebd5c4b6a77",
         "profile": "SPST4",
         "archive": "mgba-splitscreen-f1d5975.tar.gz",
@@ -180,8 +180,19 @@ def build(core, target, args):
         if core == "mgba_splitscreen":
             startup_patch = REPO / "patches/mgba-native-startup.patch"
             wrapper = source / "src/platform/libretro-splitscreen/libretro.c"
+            if "static unsigned romCount;" not in wrapper.read_text():
+                run(
+                    ["patch", "-d", source, "-p1", "--input",
+                     REPO / "patches/mgba-multi-rom.patch"], log
+                )
             if "pendingPlayers = playersOpt;" not in wrapper.read_text():
                 run(["patch", "-d", source, "-p1", "--input", startup_patch], log)
+            if "static bool _ensureSaveMemory(void)" not in wrapper.read_text():
+                run(["patch", "-d", source, "-p1", "--input",
+                     REPO / "patches/mgba-native-save-init.patch"], log)
+            if not android and "ROMM_NETPLAY_PLAYER_FILE" not in wrapper.read_text():
+                run(["patch", "-d", source, "-p1", "--input",
+                     REPO / "patches/mgba-local-player-view.patch"], log)
             platform_patch = REPO / "patches/mgba-native-platforms.patch"
             if "set(SP_CORE_SRC" not in (source / "CMakeLists.txt").read_text():
                 run(["patch", "-d", source, "-p1", "--input", platform_patch], log)
@@ -304,10 +315,21 @@ def build(core, target, args):
             patchSha256=digest(REPO / "patches" / config["patch"]),
         )
     if core == "mgba_splitscreen":
+        manifest["multiRomPatchSha256"] = digest(REPO / "patches/mgba-multi-rom.patch")
+        manifest["orderedCartridges"] = True
+        if not android:
+            manifest["localPlayerView"] = "netplay-mode-file-v1"
+            manifest["localPlayerViewPatchSha256"] = digest(
+                REPO / "patches/mgba-local-player-view.patch"
+            )
         manifest["startupPatchSha256"] = digest(
             REPO / "patches/mgba-native-startup.patch"
         )
         manifest["nativeStartup"] = "configured-players-v1"
+        manifest["saveMemoryInitialization"] = "before-first-frame-v1"
+        manifest["saveInitPatchSha256"] = digest(
+            REPO / "patches/mgba-native-save-init.patch"
+        )
         manifest["platformPatchSha256"] = digest(
             REPO / "patches/mgba-native-platforms.patch"
         )
