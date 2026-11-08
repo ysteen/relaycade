@@ -8,15 +8,23 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { WebSocket } from "ws";
 import { createBridge } from "../server.mjs";
-import { crc32 } from "../wire.mjs";
+import { crc32, CMD, words } from "../wire.mjs";
 import { linkCore } from "../client/link-core.js";
 import { BridgeConnection } from "../client/bridge-session.js";
+import { browserPeer } from "./windows-browser-peer.mjs";
 
 assert.equal(process.platform, "win32", "Use the bounded Windows runner");
 const work = resolve(process.argv[2]);
 const scenario = process.argv[3] ?? "fresh";
+const pacing = scenario === "pacing";
 const diagnostic = process.argv.includes("--diagnostic");
-assert(["fresh", "rejoin", "handoff", "web-host"].includes(scenario));
+const commercial = process.argv.includes("--commercial");
+assert(!commercial || scenario === "cable-browser");
+assert(
+  ["fresh", "rejoin", "handoff", "web-host", "cable-browser", "pacing"].includes(
+    scenario,
+  ),
+);
 const label = process.argv.find((arg) => arg.startsWith("--label="))?.slice(8);
 assert(!label || /^[a-z0-9-]+$/.test(label));
 const output = resolve(
@@ -28,12 +36,13 @@ const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 function telemetry(state) {
   const players = state.readUInt32LE(8);
   assert.equal(state.readUInt32LE(0), 0x54535053);
-  assert.equal(state.readUInt32LE(4), 4);
+  assert([4, 5].includes(state.readUInt32LE(4)));
   const stride = 64 + 131072;
   const base = state.length - 8 - players * stride + 8;
   return Array.from({ length: players }, (_, p) => {
     const start = base + p * stride;
     const sram = start + 64;
+    if (commercial) return { framesProduced: state.readUInt32LE(start + 8) };
     return {
       framesProduced: state.readUInt32LE(start + 8),
       frame: state.readUInt32LE(sram + 16),
@@ -60,6 +69,8 @@ const events = [],
   logs = [];
 const evidence = {
   scenario,
+  commercialContent: commercial,
+  cartridgeHashes: cartridges.map((item) => item.sha256),
   emulators: "Windows RetroArch",
   memoryLimitMiB: 1536,
   cpuAffinity: 3,
@@ -73,7 +84,10 @@ const bridge = await createBridge({
   logger: (event) => {
     events.push(event);
     if (event.event === "native-error") {
-      if (event.player === expectedClose && event.code === "ECONNRESET")
+      if (
+        event.player === expectedClose &&
+        (event.code === "ECONNRESET" || event.reason === "Left the room")
+      )
         evidence.expectedCloseObserved = true;
       else errors.push(event.reason);
     }
@@ -110,6 +124,17 @@ async function until(predicate, label, timeout = 15000) {
   }
 }
 async function controller(path, player, adapter = null) {
+  if (adapter?.browser) {
+    const url = base.replace("http:", "ws:") + path + "&retainRoom=1";
+    await adapter.evaluate(
+      `window.connectPeer(${JSON.stringify(url)}, ${player})`,
+    );
+    await until(
+      () => room.peers.get(player)?.kind === "web",
+      "browser connected",
+    );
+    return;
+  }
   const socket = new WebSocket(
     base.replace("http:", "ws:") +
       path +
@@ -257,12 +282,14 @@ async function launch(player, attempt) {
       resolve(work, `player-${p + 1}.gba`),
       resolve(folder, `player-${p + 1}.gba`),
     );
-    const seed = Buffer.alloc(131072, 0xff);
-    seed.fill(0xa9 + p, seed.length - 64);
-    await writeFile(
-      resolve(folder, `saves/.netplay/player-${p + 1}.sav${p ? "2" : ""}`),
-      seed,
-    );
+    if (!commercial) {
+      const seed = Buffer.alloc(131072, 0xff);
+      seed.fill(0xa9 + p, seed.length - 64);
+      await writeFile(
+        resolve(folder, `saves/.netplay/player-${p + 1}.sav${p ? "2" : ""}`),
+        seed,
+      );
+    }
   }
   await writeFile(
     resolve(folder, "options.cfg"),
@@ -300,6 +327,18 @@ async function launch(player, attempt) {
     netplay_password: "",
     libretro_log_level: "2",
   };
+  if (pacing)
+    Object.assign(config, {
+      video_driver: "d3d11",
+      video_vsync: "true",
+      video_threaded: "false",
+      audio_driver: "wasapi",
+      audio_enable: "true",
+      audio_sync: "true",
+      audio_volume: "-80",
+      libretro_info_path: work,
+      input_auto_game_focus: "0",
+    });
   const reservation = createSocket("udp4");
   await new Promise((resolve, reject) => {
     reservation.once("error", reject);
@@ -387,12 +426,17 @@ async function pressA(client) {
   }
 }
 try {
+  if (scenario === "cable-browser")
+    webAdapter = await browserPeer(work, errors);
   if (["handoff", "web-host"].includes(scenario))
     webAdapter = await loadWebAdapter();
   info = await api("", {
     system: "gba",
     coreName: "mGBA Splitscreen",
-    coreVersion: "0.1.0-f1d5975-rollback2",
+    coreVersion:
+      scenario === "cable-browser" || pacing
+        ? "0.1.0-f1d5975-cable1"
+        : "0.1.0-f1d5975-rollback2",
     players: 2,
     stateSize: webAdapter?.size ?? 1,
     contentCrc: cartridges[0].crc32,
@@ -408,7 +452,7 @@ try {
   });
   room = bridge.rooms.get(info.id);
   const nativeCheckpoint = room.nativeCheckpoint.bind(room);
-  room.nativeCheckpoint = (peer, frame, state) => {
+  room.nativeCheckpoint = (peer, frame, state, generation) => {
     (evidence.checkpoints ??= []).push({
       player: peer.player,
       frame,
@@ -416,9 +460,10 @@ try {
       crc: crc32(state),
       generation: room.generation,
       telemetry: telemetry(state),
+      cableMask: state.readUInt32LE(state.length - 8 - 2 * (64 + 131072)),
     });
     if (diagnostic && frame < 600) return;
-    return nativeCheckpoint(peer, frame, state);
+    return nativeCheckpoint(peer, frame, state, generation);
   };
   const checksum = room.checksum.bind(room);
   room.checksum = (peer, data) => {
@@ -454,13 +499,13 @@ try {
     room.state.includes(Buffer.alloc(64, value)),
   );
   assert(
-    evidence.initialBatteryMarkers.every(Boolean),
+    commercial || evidence.initialBatteryMarkers.every(Boolean),
     "Initial battery seeds were not imported",
   );
   await until(() => room.progress >= 60, "fixture startup");
   await pressA(host);
   if (guest) await pressA(guest);
-  if (scenario !== "fresh") {
+  if (!["fresh", "cable-browser", "pacing"].includes(scenario)) {
     await until(() => room.progress >= 180, "progress before rejoin");
     evidence.progressBeforeClose = room.progress;
     if (webAdapter) {
@@ -533,28 +578,171 @@ try {
         guest.peer.requestCheckpoint();
       }, 10);
   }
-  await until(
-    () => room.progress >= 1250 && guest.peer.checksSent >= 2,
-    "two native state checks",
-    26000,
-  );
-  assert.equal(errors.length, 0);
-  const finalCheckpoint = evidence.checkpoints.at(-1);
-  assert(finalCheckpoint.telemetry.every((item) => item.saves >= 1));
-  if (scenario !== "fresh")
+  if (pacing) {
+    const sample = () => ({
+      host: host.peer.nextFrame,
+      guest: guest.peer.nextFrame,
+      lead: guest.peer.nextFrame - host.peer.nextFrame,
+    });
+    await until(() => room.progress >= 120, "pacing startup");
+    const methods = [host, guest].map((client) => client.peer.pace);
+    for (const client of [host, guest]) client.peer.pace = () => {};
+    evidence.beforeStall = sample();
+    guest.peer.send(CMD.STALL, words(8));
+    await delay(300);
+    evidence.afterStall = sample();
     assert(
-      finalCheckpoint.telemetry[scenario === "web-host" ? 0 : 1].saves >
-        evidence.resumedTelemetry[scenario === "web-host" ? 0 : 1].saves,
-      "Resumed native input was not applied",
+      evidence.beforeStall.lead - evidence.afterStall.lead >= 5,
+      "The requested eight-frame stall consumed insufficient wall time",
     );
-  evidence.passed = true;
-  assert.equal(
-    evidence.hostStartRequests,
-    1,
-    "Rejoining required another host start command",
-  );
-  evidence.finalProgress = room.progress;
-  evidence.checksDelivered = guest.peer.checksSent;
+    [host, guest].forEach((client, i) => (client.peer.pace = methods[i]));
+    await until(
+      () => Math.abs(sample().lead) <= 3,
+      "host yields to the slower native participant",
+      7000,
+    );
+    evidence.behindRecovered = sample();
+    // Let the accepted stall finish before injecting another one; RetroArch
+    // ignores a second STALL while the first is still in progress.
+    await delay(700);
+    host.peer.send(CMD.STALL, words(12));
+    await delay(450);
+    evidence.guestAhead = sample();
+    assert(evidence.guestAhead.lead >= 6);
+    await until(
+      () => Math.abs(sample().lead) <= 3,
+      "guest yields to the slower native host",
+      7000,
+    );
+    evidence.aheadRecovered = sample();
+    evidence.pacedPlayers = [
+      ...new Set(events.filter((e) => e.event === "native-paced").map((e) => e.player)),
+    ].sort();
+    assert.deepEqual(evidence.pacedPlayers, [0, 1]);
+    assert.equal(room.host, 0);
+    evidence.finalProgress = room.progress;
+    evidence.passed = true;
+  } else if (scenario === "cable-browser") {
+    const snapshot = async () => {
+      const value = await webAdapter.evaluate("window.peerSnapshot()");
+      assert.deepEqual(value.errors, []);
+      return { ...value, state: Buffer.from(value.state, "base64") };
+    };
+    const checkpoint = async () => {
+      const count = evidence.checkpoints?.length ?? 0;
+      host.peer.requestCheckpoint();
+      await until(
+        () => (evidence.checkpoints?.length ?? 0) > count,
+        "native cable checkpoint",
+      );
+      return evidence.checkpoints.at(-1);
+    };
+    await until(
+      () => room.progress >= 650,
+      "initial browser/native CRC",
+      18000,
+    );
+    evidence.browserInitial = await snapshot();
+    delete evidence.browserInitial.state;
+    assert(evidence.browserInitial.stats.checks >= 5);
+    await webAdapter.evaluate("window.peer.closeGame()");
+    await until(() => room.peers.get(1)?.gameClosed, "browser returns to room");
+    let frame = room.progress;
+    await until(
+      () => room.progress > frame + 90,
+      "native continues with retained room",
+    );
+    evidence.retained = await checkpoint();
+    assert.equal(evidence.retained.cableMask, 3);
+    await webAdapter.evaluate("window.peer.stop()");
+    await until(() => !room.peers.has(1), "browser leaves room");
+    frame = room.progress;
+    await until(
+      () => room.progress > frame + 120,
+      "native continues with cable detached",
+    );
+    evidence.detached = await checkpoint();
+    assert.equal(evidence.detached.cableMask, 1);
+    assert(
+      evidence.detached.telemetry.every(
+        (p, i) =>
+          p.framesProduced > evidence.retained.telemetry[i].framesProduced,
+      ),
+    );
+    const rejoined = await api(`/${info.id}/join`, {
+      owner: owner(1),
+      romId: 12,
+      cartridge: cartridges[1],
+    });
+    await controller(rejoined.peerPath, 1, webAdapter);
+    await control(1, { t: "assign", player: 1, seat: 1 });
+    await webAdapter.evaluate("window.peer.openGame()");
+    await until(() => room.peers.get(1)?.playing, "browser rejoins live state");
+    frame = room.progress;
+    await until(
+      () => room.progress > frame + 650,
+      "CRC after cable reconnect",
+      18000,
+    );
+    evidence.reconnected = await checkpoint();
+    assert.equal(evidence.reconnected.cableMask, 3);
+    const browser = await snapshot();
+    evidence.browserRejoined = {
+      frame: browser.frame,
+      confirmed: browser.confirmed,
+      stats: browser.stats,
+    };
+    assert(browser.stats.checks >= 5);
+    expectedClose = 0;
+    await api(`/${info.id}/leave`, { owner: owner(0) });
+    await until(
+      () => !room.peers.has(0) && room.host === 1,
+      "native host leaves room",
+    );
+    frame = room.progress;
+    await until(
+      () => room.progress > frame + 90,
+      "browser continues without native host",
+    );
+    const remaining = await snapshot();
+    const mask = remaining.state.readUInt32LE(
+      remaining.state.length - 8 - 2 * (64 + 131072),
+    );
+    assert.equal(mask, 2);
+    evidence.remainingBrowser = {
+      frame: remaining.frame,
+      cableMask: mask,
+      telemetry: telemetry(remaining.state),
+    };
+    assert.equal(evidence.hostStartRequests, 1);
+    evidence.passed = true;
+  } else {
+    await until(
+      () =>
+        room.progress >= 1250 &&
+        guest.peer.checksSent + guest.peer.statesRelayed >= 2,
+      "two native state synchronizations",
+      26000,
+    );
+    assert.equal(errors.length, 0);
+    const finalCheckpoint = evidence.checkpoints.at(-1);
+    assert(finalCheckpoint.telemetry.every((item) => item.saves >= 1));
+    if (scenario !== "fresh")
+      assert(
+        finalCheckpoint.telemetry[scenario === "web-host" ? 0 : 1].saves >
+          evidence.resumedTelemetry[scenario === "web-host" ? 0 : 1].saves,
+        "Resumed native input was not applied",
+      );
+    evidence.passed = true;
+    assert.equal(
+      evidence.hostStartRequests,
+      1,
+      "Rejoining required another host start command",
+    );
+    evidence.finalProgress = room.progress;
+    evidence.checksDelivered = guest.peer.checksSent;
+    evidence.snapshotsRelayed = guest.peer.statesRelayed;
+  }
 } catch (error) {
   evidence.passed = false;
   evidence.error = error.message;
@@ -564,7 +752,7 @@ try {
   clearInterval(diagnosticTimer);
   clearInterval(webTimer);
   webConnection?.stop();
-  webAdapter?.close();
+  await webAdapter?.close();
   evidence.errors = errors;
   evidence.finalPeers = [...(room?.peers.values() ?? [])].map((peer) => ({
     player: peer.player,

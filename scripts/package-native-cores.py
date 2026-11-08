@@ -21,8 +21,8 @@ TARGETS = {
     "android-x86": ("Android x86 (32-bit)", 3),
 }
 DIRECTORIES = {
-    "sameboy": "sameboy-sbr2",
-    "mgba_splitscreen": "mgba-spst4-multi",
+    "sameboy": "sameboy-sbr3",
+    "mgba_splitscreen": "mgba-spst5",
     "snes9x": "snes9x-2d4cce69",
 }
 CORE_INFO = Path(__file__).resolve().parents[1] / "core-info"
@@ -191,6 +191,14 @@ def main():
             manifest = json.loads((source / "manifest.json").read_text())
             assert manifest["target"] == target
             assert manifest["version"] == catalog[core]["native"]["coreVersion"]
+            if core in ("sameboy", "mgba_splitscreen"):
+                cable = "sameboy-cable.patch" if core == "sameboy" else "mgba-cable.patch"
+                assert manifest.get("inputProfile") == "link-cable-r3-v1"
+                assert manifest.get("cablePatchSha256") == hashlib.sha256((CORE_INFO.parent / "patches" / cable).read_bytes()).hexdigest()
+            if core == "sameboy" and target.startswith("windows-"):
+                view_patch = CORE_INFO.parent / "patches/sameboy-local-player-view.patch"
+                assert manifest.get("localPlayerView") == "netplay-mode-file-v1"
+                assert manifest.get("localPlayerViewPatchSha256") == hashlib.sha256(view_patch.read_bytes()).hexdigest()
             if core == "mgba_splitscreen":
                 multi_rom_patch = CORE_INFO.parent / "patches/mgba-multi-rom.patch"
                 assert manifest.get("orderedCartridges") is True
@@ -218,6 +226,8 @@ def main():
         destination = (
             args.romm / "custom-emulatorjs/data/cores/compat/rollback" / folder
         )
+        if core == "sameboy":
+            shutil.copy2(CORE_INFO.parent / "patches/sameboy-local-player-view.patch", destination)
         if core == "mgba_splitscreen":
             shutil.copy2(
                 CORE_INFO.parent / "patches/mgba-native-startup.patch", destination

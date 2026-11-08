@@ -1,9 +1,10 @@
+import { WfcGateway } from "./wfc.mjs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
-import { NativePeer } from "./native.mjs";
+import { NativePeer, PACING_LEAD } from "./native.mjs";
 import {
   cartridgeManifest,
   cartridgeDescription,
@@ -11,7 +12,11 @@ import {
   NATIVE_PREPARE_MS,
   passwordMatches,
 } from "./native-launch.mjs";
-import { CMD, MAX_STATE, crc32, fixedString } from "./wire.mjs";
+import { CMD, MAX_STATE, fixedString } from "./wire.mjs";
+import { extractSaves, supportsSaves } from "./save-extract.mjs";
+import { SaveOutbox } from "./save-outbox.mjs";
+import { BridgeAdmin, adminAsset } from "./admin.mjs";
+import { cableInputProfile, CABLE_INPUT } from "./client/link-core.js";
 
 const MAX_JSON = 512 * 1024;
 const MAX_QUEUE = 20 * 1024 * 1024;
@@ -90,7 +95,21 @@ function validateManifest(body) {
     (!Number.isSafeInteger(body.romId) || body.romId < 1)
   )
     throw new Error("Invalid ROM identifier");
+  if (
+    body.disconnectPolicy !== undefined &&
+    !["continue", "pause"].includes(body.disconnectPolicy)
+  )
+    throw new Error("Invalid disconnect policy");
+  if (body.disconnectPolicy === "pause" && !body.manualStart)
+    throw new Error("Disconnect pause requires a lobby");
   const cartridges = cartridgeManifest(body);
+  if (
+    body.saveSize !== undefined &&
+    (!Number.isInteger(body.saveSize) ||
+      body.saveSize < 0 ||
+      body.saveSize > 131072)
+  )
+    throw new Error("Invalid cartridge save size");
   if (
     body.nativeAuthority !== undefined &&
     typeof body.nativeAuthority !== "boolean"
@@ -132,13 +151,17 @@ function validateManifest(body) {
     coreVersion,
     maxPrediction,
     owner,
+    inputProfile: cableInputProfile(coreName, coreVersion),
     romId: body.romId ?? null,
     cartridges,
+    saveSize: body.saveSize,
+    saveAllowed: body.saveAllowed === true,
     collectCartridges: body.collectCartridges ?? false,
     nativeAuth: body.nativeAuth ?? false,
     nativeAuthority: body.nativeAuthority ?? false,
     nativeAllowed: body.nativeAllowed ?? false,
     manualStart: body.manualStart ?? false,
+    disconnectPolicy: body.disconnectPolicy ?? "continue",
     nativeCalibration: body.nativeCalibration,
     nickname: boundedString(body.nickname, "RomM", 31),
   };
@@ -172,6 +195,11 @@ class Room {
       removedOwners: new Set(),
     });
     this.state = null;
+    this.gameOwners = null;
+    this.saveDigests = new Map();
+    this.lastSaveCapture = 0;
+    this.saveRequest = null;
+    this.saveError = null;
     this.contentPrepared = !manifest.collectCartridges;
     this.loadingContent = false;
     this.sram = Buffer.alloc(0);
@@ -192,11 +220,15 @@ class Room {
     this.host = 0;
     this.generation = 0;
     this.vacant = new Map();
+    this.detached = new Set();
     this.inputHistory = Array.from(
       { length: manifest.players },
       () => new Map(),
     );
     this.resumes = new Map();
+    this.disconnectedPlayers = new Set();
+    this.disconnectPause = null;
+    this.manualPaused = false;
     this.paused = false;
     if (manifest.manualStart) {
       this.heartbeat = setInterval(() => this.probePeers(), 2000);
@@ -242,6 +274,7 @@ class Room {
       players,
       stateSize,
       current: this.peers.size + this.reservations.size,
+      inputProfile: this.manifest.inputProfile,
       started: this.started || this.starting,
       tcpPort: this.tcpPort ?? null,
       hasPassword: !!this.password,
@@ -250,11 +283,23 @@ class Room {
       nativeAuthority: this.manifest.nativeAuthority,
       collectCartridges: this.manifest.collectCartridges,
       contentPrepared: this.contentPrepared,
+      disconnectPolicy: this.manifest.disconnectPolicy,
+      waitingForPlayers: this.disconnectPause
+        ? [...this.disconnectedPlayers]
+        : [],
       members: this.members(),
       seats: this.seats,
       generation: this.generation,
+      requiresNewGame: this.needsNewGame(),
+      saveOwners:
+        this.gameOwners?.map((entry) =>
+          entry
+            ? { player: entry.player, owner: entry.owner, romId: entry.romId }
+            : null,
+        ) ?? null,
       host: this.host,
       saveHost: this.saveHost(),
+      saves: this.saveStatus(),
       canStart: this.canStart(),
       running: !!this.running,
       starting: this.starting || this.loadingContent,
@@ -278,7 +323,10 @@ class Room {
     for (const [slot, reservation] of this.reservations) {
       if (reservation.until < Date.now()) {
         this.reservations.delete(slot);
-        if (!this.returnController(slot)) this.seats[slot] = null;
+        if (!this.returnController(slot)) {
+          this.detachCable(slot);
+          this.seats[slot] = null;
+        }
         this.loadingContent = false;
         changed = true;
       }
@@ -301,6 +349,8 @@ class Room {
             : peer.ready,
         playing: !!peer.playing,
         ping: peer.ping ?? null,
+        waitingForNewGame:
+          this.seats[peer.player] !== null && !this.canUseGame(peer),
       })),
       ...[...this.reservations]
         .filter(([, item]) => item.kind === "native")
@@ -314,6 +364,9 @@ class Room {
           ready: false,
           playing: false,
           ping: null,
+          waitingForNewGame:
+            this.seats[player] !== null &&
+            !this.canUseGame({ ...item, player }),
         })),
     ];
   }
@@ -336,6 +389,7 @@ class Room {
   removeController(player, message) {
     const controller = this.controllers.get(player);
     if (!controller) return;
+    this.detachCable(player);
     this.controllers.delete(player);
     try {
       jsonPeer(controller, {
@@ -378,11 +432,19 @@ class Room {
         !passwordMatches(peer.salt, item.nativePassword, response)
       )
         continue;
+      if (
+        !this.canReceiveGame({ ...item, player }) ||
+        (this.gameOwners &&
+          this.seats[player] !== null &&
+          !this.matchesGameCartridge({ ...item, player }))
+      )
+        return false;
       this.reservations.delete(player);
       this.pendingNative.delete(peer);
       Object.assign(peer, {
         player,
         owner: item.owner,
+        saveAllowed: item.saveAllowed,
         nickname: item.nickname,
         romId: item.romId,
         credential: item.credential,
@@ -423,8 +485,16 @@ class Room {
     return null;
   }
 
-  available(native = false) {
+  available(native = false, owner = "") {
     this.expireReservations();
+    const previous =
+      owner && this.gameOwners?.find((entry) => entry?.owner === owner);
+    if (
+      previous &&
+      !this.peers.has(previous.player) &&
+      !this.reservations.has(previous.player)
+    )
+      return previous.player;
     for (
       let slot =
         !native && this.manifest.manualStart && !this.peers.has(0) ? 0 : 1;
@@ -439,6 +509,76 @@ class Room {
     return !peer.joinRequired || peer.resumeAllowed === true;
   }
 
+  sameGameOwner(entry, peer) {
+    return (
+      entry.player === peer.player &&
+      (entry.owner
+        ? entry.owner === peer.owner
+        : entry.identity === peer.identity) &&
+      entry.romId === (peer.romId ?? this.manifest.romId)
+    );
+  }
+
+  canUseGame(peer) {
+    if (!this.gameOwners) return true;
+    const seat = this.seats[peer.player];
+    if (seat === null || seat === undefined) return false;
+    const entry = this.gameOwners[seat];
+    if (entry) return this.sameGameOwner(entry, peer);
+    if (this.hadGame) return false;
+    return this.gameOwners.every((saved) => {
+      if (!saved) return true;
+      const member =
+        this.peers.get(saved.player) ?? this.reservations.get(saved.player);
+      return (
+        saved.player !== peer.player &&
+        member &&
+        this.sameGameOwner(saved, { ...member, player: saved.player })
+      );
+    });
+  }
+
+  canReceiveGame(peer) {
+    return (
+      !this.gameOwners ||
+      this.gameOwners.some(
+        (entry) => entry && this.sameGameOwner(entry, peer),
+      ) ||
+      this.canUseGame(peer)
+    );
+  }
+
+  bindGameOwners() {
+    if (!this.manifest.manualStart || this.hadGame) return;
+    const owners = this.gameOwners ?? Array(this.manifest.players).fill(null);
+    for (const [player, member] of [...this.peers, ...this.reservations]) {
+      const seat = this.seats[player];
+      if (
+        seat === null ||
+        owners[seat] ||
+        !this.canUseGame({ ...member, player })
+      )
+        continue;
+      member.identity ??= token();
+      owners[seat] = {
+        player,
+        owner: member.owner ?? "",
+        identity: member.identity,
+        romId: member.romId ?? this.manifest.romId,
+        saveAllowed: member.saveAllowed === true,
+      };
+    }
+    if (owners.some(Boolean)) this.gameOwners = owners;
+  }
+
+  ownershipWaiting(peer) {
+    jsonPeer(this.controllers.get(peer.player) ?? peer, {
+      t: "action-error",
+      message:
+        "This player number belongs to another account or cartridge in the current game. Choose your previous player number, or wait for the host to prepare the next game with your own save.",
+    });
+  }
+
   saveHost() {
     return (
       [...this.peers.values()].find(
@@ -448,6 +588,8 @@ class Room {
   }
 
   initialBatteries() {
+    // Bind accounts before a launcher receives the shared save bundle.
+    this.bindGameOwners();
     const members = [...this.peers, ...this.reservations];
     return this.manifest.cartridges.map((_, seat) => {
       const member =
@@ -458,15 +600,139 @@ class Room {
     });
   }
 
+  saveStatus() {
+    const enabled =
+      !!this.bridge.saves &&
+      this.manifest.manualStart &&
+      supportsSaves(this.manifest);
+    const pending = this.bridge.saves?.list(this.id) ?? [];
+    return {
+      enabled,
+      pending: pending.length,
+      synced: !!this.savesSynced,
+      error:
+        this.saveError ?? pending.find((entry) => entry.error)?.error ?? null,
+    };
+  }
+
+  publishSaveStatus() {
+    if (this.closed) return;
+    for (const peer of [...this.peers.values(), ...this.controllers.values()]) {
+      try {
+        jsonPeer(peer, { t: "save-status", ...this.saveStatus() });
+      } catch {
+        // Save notifications must not interrupt a running game.
+      }
+    }
+  }
+
+  captureSaves(peer, frame, state) {
+    if (
+      !this.saveStatus().enabled ||
+      !this.running ||
+      this.starting ||
+      !peer.playing ||
+      !this.canUseGame(peer) ||
+      this.peers.get(peer.player) !== peer ||
+      !uint(frame) ||
+      frame > peer.nextFrame ||
+      state.length !== this.manifest.stateSize
+    )
+      return Promise.reject(new Error("No active game save is available"));
+    let saves;
+    try {
+      saves = extractSaves(this.manifest, state);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const generation = this.generation;
+    if (
+      this.savedFrame?.generation === generation &&
+      frame < this.savedFrame.frame
+    )
+      return Promise.resolve();
+    this.savedFrame = { generation, frame };
+    const entries = (this.gameOwners ?? [])
+      .map((owner, seat) => {
+        const battery = saves[this.manifest.system === "snes" ? 0 : seat];
+        if (!owner?.owner || !owner.saveAllowed || !battery?.length)
+          return null;
+        const key = JSON.stringify([owner.owner, owner.player, owner.romId]);
+        const encoded = battery.toString("base64");
+        if (this.saveDigests.get(key) === encoded) return null;
+        return {
+          key,
+          roomId: this.id,
+          owner: owner.owner,
+          player: owner.player,
+          romId: owner.romId,
+          coreName: this.manifest.coreName,
+          generation,
+          frame,
+          battery: encoded,
+        };
+      })
+      .filter(Boolean);
+    this.lastSaveCapture = Date.now();
+    const work = Promise.all(
+      entries.map(({ key, ...entry }) =>
+        this.bridge.saves
+          .put(entry)
+          .then(() => this.saveDigests.set(key, entry.battery)),
+      ),
+    );
+    return work.then(() => {
+      this.saveError = null;
+      this.publishSaveStatus();
+    });
+  }
+
+  saveFailed(error) {
+    this.saveError = error.message;
+    this.bridge.log("save-error", { room: this.id, reason: error.message });
+    this.publishSaveStatus();
+  }
+
+  requestSave() {
+    if (
+      !this.saveStatus().enabled ||
+      !this.running ||
+      this.starting ||
+      this.saveRequest
+    )
+      return;
+    const source =
+      [...this.peers.values()].find(
+        (peer) => peer.kind === "web" && peer.playing,
+      ) ?? this.peers.get(this.host);
+    if (!source?.playing || !this.canUseGame(source)) return;
+    this.lastSaveCapture = Date.now();
+    if (source.kind === "native") {
+      source.requestCheckpoint();
+      return;
+    }
+    const request = { id: token(), source, generation: this.generation };
+    request.timer = setTimeout(() => {
+      if (this.saveRequest !== request) return;
+      this.saveRequest = null;
+      this.saveFailed(new Error("The browser save snapshot timed out"));
+    }, 10000);
+    request.timer.unref();
+    this.saveRequest = request;
+    jsonPeer(source, { t: "resume-source", id: request.id });
+  }
+
   canStart() {
-    if (this.needsNewCartridges()) {
+    if (this.needsNewGame()) {
       const members = [...this.peers, ...this.reservations];
       return (
         !this.starting &&
         !this.loadingContent &&
         members.length === this.manifest.players &&
         members.every(
-          ([player, member]) => this.seats[player] !== null && member.cartridge,
+          ([player, member]) =>
+            this.seats[player] !== null &&
+            (!this.manifest.collectCartridges || member.cartridge),
         )
       );
     }
@@ -528,13 +794,19 @@ class Room {
     this.notify({
       t: "lobby",
       generation: this.generation,
+      requiresNewGame: this.needsNewGame(),
       players: this.manifest.players,
       seats: this.seats,
       host: this.host,
       saveHost: this.saveHost(),
+      saves: this.saveStatus(),
       running: !!this.running,
       starting: this.starting || this.loadingContent,
       contentPrepared: this.contentPrepared,
+      disconnectPolicy: this.manifest.disconnectPolicy,
+      waitingForPlayers: this.disconnectPause
+        ? [...this.disconnectedPlayers]
+        : [],
       collectCartridges: this.manifest.collectCartridges,
       cartridges: this.manifest.cartridges,
       canStart: this.canStart(),
@@ -549,6 +821,33 @@ class Room {
     };
     if (!this.manifest.manualStart)
       return reject("This room does not have a lobby");
+    if (data.t === "disconnect-policy") {
+      if (this.starting || this.loadingContent)
+        return reject("The game is already starting");
+      if (peer.player !== this.host)
+        return reject("Only the host can change the disconnect policy");
+      if (!["continue", "pause"].includes(data.disconnectPolicy))
+        return reject("Invalid disconnect policy");
+      if (
+        data.disconnectPolicy === "pause" &&
+        [...this.peers.values()].some(
+          (p) => p.kind === "native" && !p.managedPause,
+        )
+      )
+        return reject(
+          "Update and register every Windows launcher before enabling pause on disconnect",
+        );
+      this.manifest.disconnectPolicy = data.disconnectPolicy;
+      if (data.disconnectPolicy === "continue") {
+        this.disconnectPause = null;
+        for (const request of [...this.resumes.values()])
+          if (request.autoResume) this.cancelResume(request);
+        this.setPaused(this.manualPaused, null, true);
+        for (const other of this.peers.values()) this.resumeGame(other);
+      } else this.pauseForDisconnect();
+      this.lobby();
+      return;
+    }
     if (data.t === "kick") {
       if (peer.player !== this.host)
         return reject("Only the host can remove a player");
@@ -560,6 +859,7 @@ class Room {
       if (target.owner) this.removedOwners.add(target.owner);
       this.removeController(data.player, "Removed from the room by the host");
       this.reservations.delete(data.player);
+      this.detachCable(data.player);
       this.seats[data.player] = null;
       this.loadingContent = false;
       const message = "Removed from the room by the host";
@@ -584,7 +884,7 @@ class Room {
       return reject(
         "Wait for every player to connect and choose a player number",
       );
-    if (this.needsNewCartridges()) {
+    if (this.needsNewGame()) {
       this.resetContent();
       return;
     }
@@ -596,8 +896,9 @@ class Room {
       this.manifest.romId = cartridges[0].romId;
       this.manifest.contentCrc = cartridges[0].crc32;
       this.contentPrepared = true;
+      this.bindGameOwners();
       this.loadingContent = true;
-      this.notify(this.contentPacket());
+      for (const member of this.peers.values()) this.sendContent(member);
       this.lobby();
       return;
     }
@@ -616,6 +917,7 @@ class Room {
   }
 
   beginStart() {
+    this.bindGameOwners();
     const host = this.peers.get(this.host);
     if (this.manifest.nativeAuthority && host?.kind === "native") {
       host.requestRestartSource();
@@ -632,6 +934,19 @@ class Room {
     };
   }
 
+  sendContent(peer) {
+    if (
+      peer.kind !== "web" ||
+      peer.gameClosed ||
+      peer.contentReady ||
+      peer.reloading ||
+      !this.canUseGame(peer)
+    )
+      return;
+    peer.reloading = true;
+    jsonPeer(peer, this.contentPacket());
+  }
+
   needsNewCartridges() {
     return (
       this.manifest.collectCartridges &&
@@ -644,15 +959,36 @@ class Room {
     );
   }
 
+  needsNewGame() {
+    return (
+      this.needsNewCartridges() ||
+      (!!this.gameOwners &&
+        [...this.peers, ...this.reservations].some(
+          ([player, member]) =>
+            this.seats[player] !== null &&
+            !this.canUseGame({ ...member, player }),
+        ))
+    );
+  }
+
   resetContent() {
+    this.saveDigests.clear();
+    clearTimeout(this.saveRequest?.timer);
+    this.saveRequest = null;
     this.started = this.running = this.starting = this.loadingContent = false;
-    this.contentPrepared = this.hadGame = this.paused = false;
+    this.contentPrepared = !this.manifest.collectCartridges;
+    this.hadGame = this.paused = this.manualPaused = false;
+    this.disconnectPause = null;
+    this.disconnectedPlayers.clear();
+    this.gameOwners = null;
     this.startPlayers = null;
     this.generation++;
+    this.nativePacingSource = null;
     this.state = null;
     this.sram = Buffer.alloc(0);
     this.pendingBatteries.clear();
     this.vacant.clear();
+    this.detached.clear();
     this.crcs.clear();
     this.heldInputs.length = 0;
     this.progress = this.confirmed = this.nextHostFrame = 0;
@@ -690,8 +1026,10 @@ class Room {
     for (const request of [...this.resumes.values()])
       if (request.peer === peer || request.source === peer)
         this.cancelResume(request);
-    if (peer.playing && this.running)
+    if (peer.playing && this.running) {
       this.vacant.set(peer.player, peer.nextFrame);
+      this.disconnectedPlayers.add(peer.player);
+    }
     peer.gameClosed = true;
     peer.playing = peer.contentReady = peer.reloading = false;
     peer.ready = -1;
@@ -703,6 +1041,7 @@ class Room {
       this.paused = false;
     }
     this.electHost();
+    this.pauseForDisconnect();
     this.fillVacancies();
     this.lobby();
   }
@@ -712,6 +1051,11 @@ class Room {
       return;
     peer.resumeAllowed = true;
     peer.gameClosed = false;
+    if (!this.canUseGame(peer)) {
+      this.ownershipWaiting(peer);
+      this.lobby();
+      return;
+    }
     if (
       this.running &&
       this.seats[peer.player] !== null &&
@@ -722,10 +1066,7 @@ class Room {
       return;
     }
     if (peer.contentReady) this.resumeGame(peer);
-    else if (this.contentPrepared && !peer.reloading) {
-      peer.reloading = true;
-      jsonPeer(peer, this.contentPacket());
-    }
+    else if (this.contentPrepared) this.sendContent(peer);
     this.lobby();
   }
 
@@ -734,6 +1075,7 @@ class Room {
       if (controller.owner === owner) this.removeController(player);
     for (const [player, member] of this.reservations)
       if (member.owner === owner) {
+        this.detachCable(player);
         this.reservations.delete(player);
         this.seats[player] = null;
       }
@@ -752,6 +1094,10 @@ class Room {
   }
 
   resumeGame(peer) {
+    if (this.disconnectPause) {
+      this.resumeDisconnectedPlayers();
+      return;
+    }
     if (
       !this.running ||
       this.starting ||
@@ -770,6 +1116,10 @@ class Room {
           peer.restarting
     )
       return;
+    if (!this.canUseGame(peer)) {
+      this.ownershipWaiting(peer);
+      return;
+    }
     if (!this.matchesGameCartridge(peer)) {
       this.cartridgeWaiting(peer);
       return;
@@ -793,6 +1143,7 @@ class Room {
             other.kind === "native" &&
             !other.restartSourceRequested &&
             !other.resumeSourceId &&
+            !other.checkpointRelay &&
             !other.checkpointRequested,
         )
       : undefined;
@@ -803,6 +1154,7 @@ class Room {
         (other) =>
           other.kind === "native" &&
           !other.checkpointRequested &&
+          !other.checkpointRelay &&
           !other.resumeSourceId &&
           !other.restartSourceRequested,
       );
@@ -815,7 +1167,7 @@ class Room {
       });
       return;
     }
-    const request = { id: token(), peer, source };
+    const request = { id: token(), peer, source, generation: this.generation };
     peer.resumeId = request.id;
     request.timer = setTimeout(
       () =>
@@ -864,6 +1216,10 @@ class Room {
     if (!this.resumes.delete(request.id)) return;
     clearTimeout(request.timer);
     request.peer.resumeId = null;
+    if (request.autoResume && this.disconnectPause) {
+      this.disconnectPause.recovering = false;
+      this.setPaused(true, null, true);
+    }
     if (message) jsonPeer(request.peer, { t: "action-error", message });
   }
 
@@ -871,25 +1227,63 @@ class Room {
     const request = this.resumes.get(id);
     if (!request || request.source !== source) return;
     const target = request.peer;
-    if (target.kind === "native") {
+    if (
+      request.generation !== this.generation ||
+      this.peers.get(target.player) !== target ||
+      !this.canUseGame(target) ||
+      !this.canUseGame(source)
+    ) {
+      this.cancelResume(request);
+      return;
+    }
+    if (request.autoResume) {
+      const targets = request.targets;
+      if (
+        !targets.every((peer) => this.canResumeDisconnected(peer)) ||
+        this.peers.get(source.player) !== source ||
+        !source.playing
+      ) {
+        this.cancelResume(request);
+        return;
+      }
+      this.disconnectPause = null;
+      this.cancelResume(request);
+      for (const peer of this.peers.values())
+        if (peer.kind === "native" && peer.playing) peer.setRoomPaused(false);
+      this.starting = true;
+      this.prepareGame(state, target, targets.slice(1));
+      return;
+    }
+    if (
+      target.kind === "native" ||
+      (source.kind === "native" && this.manifest.nativeAuthority)
+    ) {
+      // Native snapshots rebase rollback history; all active peers need that boundary.
       this.cancelResume(request);
       if (
         !this.running ||
         this.starting ||
         this.paused ||
         this.peers.get(target.player) !== target ||
-        !target.ready ||
+        (target.kind === "native"
+          ? !target.ready
+          : target.gameClosed ||
+            !target.contentReady ||
+            !target.resumeAllowed) ||
         !this.matchesGameCartridge(target)
       )
         return;
-      this.bridge.log("native-auto-join", {
-        room: this.id,
-        player: target.player,
-        sourcePlayer: source.player,
-        sourceKind: source.kind,
-        frame,
-        generation: this.generation,
-      });
+      this.bridge.log(
+        target.kind === "native" ? "native-auto-join" : "web-native-join",
+        {
+          room: this.id,
+          player: target.player,
+          sourcePlayer: source.player,
+          sourceKind: source.kind,
+          frame,
+          generation: this.generation,
+        },
+      );
       this.starting = true;
       this.prepareGame(state, target);
       return;
@@ -925,6 +1319,7 @@ class Room {
     target.lastCheckpoint = Math.floor(frame / 60) * 60;
     target.playing = true;
     this.vacant.delete(target.player);
+    this.detached.delete(target.player);
     this.bridge.log("web-resumed", {
       room: this.id,
       player: target.player,
@@ -949,13 +1344,30 @@ class Room {
     this.lobby();
   }
 
-  prepareGame(source, joiningPeer = null) {
+  prepareGame(source, joiningPeer = null, additionalPeers = []) {
+    if (this.needsNewGame() && !joiningPeer) {
+      this.starting = false;
+      this.lobby();
+      return;
+    }
+    if (
+      joiningPeer &&
+      [joiningPeer, ...additionalPeers].some((peer) => !this.canUseGame(peer))
+    )
+      return;
+    this.bindGameOwners();
     for (const request of [...this.resumes.values()])
       this.cancelResume(request);
     const restarting = this.started;
     this.startPlayers = new Set(
       [...this.peers.values()]
-        .filter((peer) => !joiningPeer || peer.playing || peer === joiningPeer)
+        .filter(
+          (peer) =>
+            !joiningPeer ||
+            peer.playing ||
+            peer === joiningPeer ||
+            additionalPeers.includes(peer),
+        )
         .map((peer) => peer.player),
     );
     const nativeState =
@@ -985,6 +1397,7 @@ class Room {
       used.add(seat);
     }
     this.generation++;
+    for (const player of this.startPlayers) this.detached.delete(player);
     this.bridge.log("game-starting", {
       room: this.id,
       generation: this.generation,
@@ -1067,6 +1480,8 @@ class Room {
       player: slot,
       nickname: reservation.nickname,
       owner: reservation.owner,
+      saveAllowed: reservation.saveAllowed,
+      identity: reservation.credential,
       romId: reservation.romId,
       cartridge: reservation.cartridge,
       contentReady: !this.manifest.collectCartridges,
@@ -1094,6 +1509,8 @@ class Room {
       t: "joined",
       player: slot,
       players: this.manifest.players,
+      serverSaves: this.saveStatus().enabled,
+      inputProfile: this.manifest.inputProfile,
       ...(this.manifest.manualStart
         ? {
             manualStart: true,
@@ -1116,7 +1533,11 @@ class Room {
             throw new Error("Invalid room control message");
           const data = JSON.parse(bytes.toString());
           if (data.t === "pong") this.pong(peer, data.nonce);
-          else if (["assign", "start-request", "kick"].includes(data.t))
+          else if (
+            ["assign", "start-request", "kick", "disconnect-policy"].includes(
+              data.t,
+            )
+          )
             this.control(peer, data);
           return;
         }
@@ -1143,10 +1564,11 @@ class Room {
     if (
       this.manifest.collectCartridges &&
       this.contentPrepared &&
+      this.canUseGame(peer) &&
       (!this.running ||
         (this.seats[slot] !== null && this.matchesGameCartridge(peer)))
     )
-      jsonPeer(peer, this.contentPacket());
+      this.sendContent(peer);
   }
 
   message(peer, data) {
@@ -1161,11 +1583,30 @@ class Room {
       (data.generation ?? 0) !== this.generation
     ) {
       if ((data.generation ?? 0) < this.generation) {
-        if (data.t === "state" || data.t === "battery")
+        if (["state", "battery", "save-state", "resume-state"].includes(data.t))
           peer.transfer = { ...data, discard: true };
         return;
       }
       throw new Error("Invalid room generation");
+    }
+    if (
+      !this.canUseGame(peer) &&
+      [
+        "state",
+        "battery",
+        "ready",
+        "content-ready",
+        "native-ready",
+        "input",
+        "progress",
+        "crc",
+        "pause",
+      ].includes(data.t)
+    ) {
+      if (["state", "battery", "save-state", "resume-state"].includes(data.t))
+        peer.transfer = { ...data, discard: true };
+      this.ownershipWaiting(peer);
+      return;
     }
     switch (data.t) {
       case "seed-battery":
@@ -1176,6 +1617,7 @@ class Room {
       case "assign":
       case "start-request":
       case "kick":
+      case "disconnect-policy":
         this.control(peer, data);
         return;
       case "game-close":
@@ -1185,7 +1627,9 @@ class Room {
         this.openGame(peer);
         return;
       case "resume-state": {
-        const request = this.resumes.get(data.id);
+        const request =
+          this.resumes.get(data.id) ??
+          (this.saveRequest?.id === data.id ? this.saveRequest : null);
         if (
           !uint(data.f) ||
           data.size !== this.manifest.stateSize ||
@@ -1195,6 +1639,18 @@ class Room {
         peer.transfer = { ...data, discard: !request };
         return;
       }
+      case "save-state":
+        if (
+          !peer.playing ||
+          !this.canUseGame(peer) ||
+          !uint(data.f) ||
+          data.size !== this.manifest.stateSize ||
+          typeof data.id !== "string" ||
+          data.id.length > 64
+        )
+          throw new Error("Invalid save snapshot");
+        peer.transfer = { ...data };
+        return;
       case "content-ready":
         if (
           (!this.manifest.collectCartridges && !peer.reloading) ||
@@ -1343,6 +1799,7 @@ class Room {
       throw new Error("Invalid binary transfer size");
     if (
       transfer.discard ||
+      !this.canUseGame(peer) ||
       (this.manifest.manualStart &&
         (transfer.generation ?? 0) !== this.generation)
     )
@@ -1358,7 +1815,35 @@ class Room {
       return;
     }
     if (transfer.t === "resume-state") {
+      if (this.saveRequest?.id === transfer.id) {
+        const request = this.saveRequest;
+        this.saveRequest = null;
+        clearTimeout(request.timer);
+        if (request.generation === this.generation && request.source === peer)
+          void this.captureSaves(peer, transfer.f, bytes).catch((error) =>
+            this.saveFailed(error),
+          );
+        return;
+      }
       this.completeResume(peer, transfer.id, transfer.f, bytes);
+      return;
+    }
+    if (transfer.t === "save-state") {
+      void this.captureSaves(peer, transfer.f, bytes)
+        .then(
+          () => ({ t: "save-stored", id: transfer.id }),
+          (error) => {
+            this.saveFailed(error);
+            return { t: "save-stored", id: transfer.id, error: error.message };
+          },
+        )
+        .then((reply) => {
+          try {
+            jsonPeer(peer, reply);
+          } catch {
+            // The client may have closed or congested while the disk was busy.
+          }
+        });
       return;
     }
     this.state = Buffer.from(bytes);
@@ -1396,6 +1881,7 @@ class Room {
   }
 
   sendWebState(peer, frame) {
+    if (!this.canUseGame(peer)) return;
     jsonPeer(peer, {
       t: "state",
       f: frame,
@@ -1457,7 +1943,10 @@ class Room {
       generation: this.generation,
     });
     this.nativeClockAt = performance.now();
-    for (const peer of this.startingPeers()) peer.playing = true;
+    for (const peer of this.startingPeers()) {
+      peer.playing = true;
+      this.disconnectedPlayers.delete(peer.player);
+    }
     this.electHost();
     for (const peer of this.startingPeers())
       if (peer.kind === "native") peer.finishStart();
@@ -1473,6 +1962,8 @@ class Room {
     for (const peer of this.startingPeers())
       if (peer.kind === "native") peer.flushInputs?.();
     this.startPlayers = null;
+    if (this.manualPaused) this.setPaused(true);
+    this.pauseForDisconnect();
     this.lobby();
   }
 
@@ -1485,6 +1976,8 @@ class Room {
       frame !== peer.nextFrame
     )
       throw new Error("Input frames must be sequential");
+    if (this.manifest.inputProfile && buttons & CABLE_INPUT)
+      throw new Error("Cable control input is reserved for the broker");
     if (frame > this.progress + 120)
       throw new Error("Input exceeds host frame window");
     peer.nextFrame++;
@@ -1502,8 +1995,9 @@ class Room {
       );
       this.progress = host.frame;
       this.confirmed = host.confirmed;
+      const reference = this.nativePacingReference();
       for (const other of this.peers.values())
-        if (other.kind === "native" && other !== host) other.pace(host);
+        if (other.kind === "native") other.pace(reference);
       if (peer === host) this.publishClock(host);
       if (
         peer === host &&
@@ -1534,6 +2028,28 @@ class Room {
     }
     this.relayInput(peer, frame, buttons);
     this.fillVacancies();
+  }
+
+  nativePacingReference() {
+    const host = this.peers.get(this.host);
+    const active = [...this.peers.values()].filter((peer) => peer.playing);
+    if (!host?.playing || active.some((peer) => peer.kind !== "native")) {
+      this.nativePacingSource = null;
+      return host;
+    }
+    const slowest = active.reduce(
+      (source, peer) => (peer.frame < source.frame ? peer : source),
+      host,
+    );
+    const previous = this.nativePacingSource;
+    // Do not switch references on ordinary packet ordering or a one-frame tie.
+    // A software-paced peer cannot catch a host that keeps advancing equally fast.
+    if (
+      !active.includes(previous) ||
+      previous.frame - slowest.frame > PACING_LEAD
+    )
+      this.nativePacingSource = slowest;
+    return this.nativePacingSource;
   }
 
   publishClock(host) {
@@ -1617,25 +2133,27 @@ class Room {
       if (frame < this.latestCheckpoint - 600) this.crcs.delete(frame);
   }
 
-  nativeCheckpoint(peer, frame, state) {
+  nativeCheckpoint(peer, frame, state, generation = this.generation) {
     if (
       !this.running ||
+      generation !== this.generation ||
       peer.player !== this.host ||
       !uint(frame) ||
       frame > peer.nextFrame ||
       frame < this.progress - 600
     )
       return;
-    const crc = crc32(state);
-    for (const other of this.peers.values())
-      if (other.kind === "native" && other !== peer && other.playing)
-        other.sendCrc(frame, crc);
+    if (this.saveStatus().enabled)
+      void this.captureSaves(peer, frame, state).catch((error) =>
+        this.saveFailed(error),
+      );
     this.bridge.log("native-checkpoint", {
       room: this.id,
       player: peer.player,
       frame,
       generation: this.generation,
     });
+    return true;
   }
 
   requestState() {
@@ -1672,28 +2190,131 @@ class Room {
       return;
     }
     if (!this.started) throw new Error("Pause requested before start");
-    if (this.paused === paused) return;
+    if (this.disconnectPause?.recovering && !paused) return;
+    this.manualPaused = paused;
+    this.setPaused(
+      paused || !!this.disconnectPause,
+      peer,
+      !!this.disconnectPause,
+    );
+    if (!this.paused)
+      for (const other of this.peers.values()) this.resumeGame(other);
+  }
+
+  setPaused(paused, origin = null, force = false) {
+    if (this.paused === paused && !force) return;
+    this.paused = paused;
     this.bridge.log("game-pause", {
       room: this.id,
-      player: peer.player,
-      kind: peer.kind,
       paused,
       frame: this.progress,
+      automatic: !!this.disconnectPause,
     });
-    this.paused = paused;
-    for (const other of this.peers.values()) {
-      if (this.manifest.manualStart && !other.playing) continue;
-      if (other.kind === "native") {
-        if (other !== peer)
-          other.send(
+    for (const peer of this.peers.values()) {
+      if (!peer.playing) continue;
+      if (peer.kind === "native") {
+        if (peer.probe) {
+          if (paused) {
+            peer.probe.suspended = true;
+            delete peer.probe.resumedAt;
+          } else if (peer.probe.suspended) peer.probe.resumedAt = performance.now();
+        }
+        if (this.disconnectPause) {
+          peer.setRoomPaused(paused);
+          continue;
+        }
+        if (peer !== origin || force)
+          peer.send(
             paused ? CMD.PAUSE : CMD.RESUME,
-            paused ? fixedString(peer.nickname) : undefined,
+            paused ? fixedString("Waiting for player") : undefined,
           );
-      } else if (!this.manifest.manualStart || other.playing)
-        jsonPeer(other, { t: "pause", paused });
+      } else jsonPeer(peer, { t: "pause", paused });
     }
-    if (!paused)
-      for (const other of this.peers.values()) this.resumeGame(other);
+  }
+
+  pauseForDisconnect() {
+    if (
+      !this.running ||
+      ![...this.peers.values()].some((peer) => peer.playing)
+    ) {
+      this.disconnectPause = null;
+      return;
+    }
+    if (
+      this.manifest.disconnectPolicy !== "pause" ||
+      !this.disconnectedPlayers.size
+    )
+      return;
+    this.disconnectPause ??= { recovering: false };
+    if (!this.disconnectPause.recovering) this.setPaused(true);
+  }
+
+  canResumeDisconnected(peer) {
+    return (
+      peer &&
+      this.peers.get(peer.player) === peer &&
+      !peer.playing &&
+      this.seats[peer.player] === this.gameSeats?.[peer.player] &&
+      this.canUseGame(peer) &&
+      this.matchesGameCartridge(peer) &&
+      (peer.kind === "native"
+        ? peer.ready && !peer.bootstrapping && !peer.restarting
+        : !peer.gameClosed && peer.contentReady && peer.resumeAllowed)
+    );
+  }
+
+  resumeDisconnectedPlayers() {
+    if (
+      !this.disconnectPause ||
+      this.disconnectPause.recovering ||
+      !this.running ||
+      this.starting
+    )
+      return;
+    const targets = [...this.disconnectedPlayers].map((player) =>
+      this.peers.get(player),
+    );
+    if (
+      !targets.length ||
+      !targets.every((peer) => this.canResumeDisconnected(peer))
+    )
+      return;
+    const active = [...this.peers.values()].filter(
+      (peer) =>
+        peer.playing &&
+        !peer.checkpointRelay &&
+        !peer.resumeSourceId &&
+        !peer.restartSourceRequested,
+    );
+    const source =
+      active.find((peer) => peer.player === this.host) ?? active[0];
+    if (!source) return;
+    const request = {
+      id: token(),
+      peer: targets[0],
+      targets,
+      source,
+      generation: this.generation,
+      autoResume: true,
+    };
+    this.disconnectPause.recovering = true;
+    request.peer.resumeId = request.id;
+    this.resumes.set(request.id, request);
+    request.timer = setTimeout(
+      () =>
+        this.cancelResume(
+          request,
+          "Could not synchronize the paused game. Try joining again.",
+        ),
+      10000,
+    );
+    request.timer.unref();
+    if (source.kind === "native") {
+      // RetroArch serves snapshots in its frame loop, so release only the source.
+      this.paused = false;
+      source.setRoomPaused(false);
+      source.requestResumeSource(request.id);
+    } else jsonPeer(source, { t: "resume-source", id: request.id });
   }
 
   notify(message) {
@@ -1769,7 +2390,11 @@ class Room {
     const end = Math.max(...active.map((peer) => peer.nextFrame));
     for (const [player, next] of this.vacant) {
       for (let frame = next; frame < end; frame++)
-        this.relayInput({ player }, frame, 0);
+        this.relayInput(
+          { player },
+          frame,
+          this.detached.has(player) ? CABLE_INPUT : 0,
+        );
       this.vacant.set(player, Math.max(next, end));
     }
   }
@@ -1809,12 +2434,33 @@ class Room {
       return;
     }
     const now = performance.now();
+    if (
+      !this.paused &&
+      Date.now() - this.lastSaveCapture >=
+        this.bridge.admin.settings.saveIntervalSeconds * 1000
+    ) {
+      try {
+        this.requestSave();
+      } catch (error) {
+        clearTimeout(this.saveRequest?.timer);
+        this.saveRequest = null;
+        this.saveFailed(error);
+      }
+    }
     for (const peer of [...this.peers.values(), ...this.controllers.values()]) {
       if (peer.kind === "native" && (peer.phase !== "connected" || !peer.ready))
         continue;
+      if (peer.kind === "native" && this.paused) {
+        // RetroArch can stop servicing PING while its frontend is paused.
+        // Retain the ordered PONG for restart barriers, excluding paused time.
+        if (peer.probe) peer.probe.suspended = true;
+        continue;
+      }
       if (peer.probe) {
-        if (now - peer.probe.sent > 6000) peer.ping = null;
-        if (now - peer.probe.sent > 15000) {
+        if (peer.probe.suspended) peer.probe.resumedAt ??= now;
+        const elapsed = now - (peer.probe.resumedAt ?? peer.probe.sent);
+        if (elapsed > 6000) peer.ping = null;
+        if (elapsed > 15000) {
           if (peer.kind === "native") peer.drop("Native heartbeat timed out");
           else peer.ws.terminate();
         }
@@ -1832,21 +2478,59 @@ class Room {
       }
     }
     this.publishPings();
+    this.logTiming();
     for (const peer of this.peers.values())
-      if (peer.kind === "native") this.resumeGame(peer);
+      if (peer.kind === "native" || this.disconnectPause) this.resumeGame(peer);
   }
 
   pong(peer, nonce) {
     if (!peer.probe || (peer.kind === "web" && peer.probe.nonce !== nonce))
       return;
-    const sample = performance.now() - peer.probe.sent;
-    peer.ping = Math.round(
-      peer.ping === null || peer.ping === undefined
-        ? sample
-        : peer.ping * 0.7 + sample * 0.3,
-    );
+    if (!peer.probe.suspended) {
+      const sample = performance.now() - peer.probe.sent;
+      peer.ping = Math.round(
+        peer.ping === null || peer.ping === undefined
+          ? sample
+          : peer.ping * 0.7 + sample * 0.3,
+      );
+    }
     peer.probe = null;
     this.publishPings();
+  }
+
+  logTiming() {
+    if (!this.running) return;
+    const host = this.peers.get(this.host);
+    if (!host?.playing) return;
+    const hostFrame =
+      host.kind === "native"
+        ? Math.max(0, host.lastReportedFrame - host.frameOffset)
+        : host.frame;
+    for (const peer of this.peers.values()) {
+      if (!peer.playing) continue;
+      const inputFrame =
+        peer.kind === "native"
+          ? Math.max(0, peer.lastReportedFrame - peer.frameOffset)
+          : Math.max(0, peer.nextFrame - 1);
+      this.bridge.log("game-timing", {
+        room: this.id,
+        generation: this.generation,
+        player: peer.player,
+        kind: peer.kind,
+        host: this.host,
+        hostKind: host.kind,
+        hostFrame,
+        inputFrame,
+        inputLeadFrames: inputFrame - hostFrame,
+        pingMs: peer.ping ?? null,
+        hostPingMs: host.ping ?? null,
+        paused: !!this.paused,
+        queuedBytes:
+          peer.kind === "native"
+            ? peer.socket.writableLength
+            : peer.ws.bufferedAmount,
+      });
+    }
   }
 
   publishPings() {
@@ -1856,6 +2540,28 @@ class Room {
         player: peer.player,
         ping: peer.ping ?? null,
       })),
+    });
+  }
+
+  detachCable(player, frame) {
+    if (
+      this.closed ||
+      !this.manifest.inputProfile ||
+      !this.hadGame ||
+      this.detached.has(player)
+    )
+      return;
+    this.detached.add(player);
+    this.bridge.log("cable-detached", {
+      room: this.id,
+      player,
+      seat: this.gameSeats?.[player],
+      generation: this.generation,
+      frame:
+        this.vacant.get(player) ??
+        frame ??
+        this.peers.get(player)?.nextFrame ??
+        0,
     });
   }
 
@@ -1870,14 +2576,17 @@ class Room {
     this.pendingBatteries.delete(peer.player);
     const returned =
       peer.kind === "native" && this.returnController(peer.player);
+    if (!returned) this.detachCable(peer.player, peer.nextFrame);
     if (this.manifest.manualStart) {
       if (!this.peers.size && !this.reservations.size) {
         this.close("The last player left");
         return;
       }
       const wasHost = peer.player === this.host;
-      if (peer.playing && this.running)
+      if (peer.playing && this.running) {
         this.vacant.set(peer.player, peer.nextFrame);
+        this.disconnectedPlayers.add(peer.player);
+      }
       if (!returned && this.reservations.get(peer.player)?.kind !== "native")
         this.seats[peer.player] = null;
       if (
@@ -1892,6 +2601,7 @@ class Room {
         this.notify({ t: "peer-left", player: peer.player, message });
       if (this.starting && wasHost && this.host !== null) this.beginStart();
       else if (this.starting) this.maybeStart();
+      this.pauseForDisconnect();
       this.fillVacancies();
       this.lobby();
       return;
@@ -1911,6 +2621,8 @@ class Room {
       reason: message,
     });
     this.closed = true;
+    clearTimeout(this.saveRequest?.timer);
+    this.saveRequest = null;
     for (const player of this.controllers.keys())
       this.removeController(player, message);
     for (const request of [...this.resumes.values()])
@@ -1947,18 +2659,30 @@ export async function createBridge({
   portStart = 55435,
   portEnd = 55442,
   maxRooms = 8,
+  saveDirectory = null,
   allowedOrigins = [],
+  wfcHelper = null,
   logger = (entry) => console.info(JSON.stringify(entry)),
 } = {}) {
   if (typeof adminToken !== "string" || adminToken.length < 24)
     throw new Error("Bridge admin token must contain at least 24 characters");
   const rooms = new Map();
+  const admin = await new BridgeAdmin(saveDirectory, maxRooms).init();
   const bridge = {
     rooms,
+    admin,
+    saves: saveDirectory ? await new SaveOutbox(saveDirectory).init() : null,
     log(event, fields = {}) {
-      logger({ time: new Date().toISOString(), event, ...fields });
+      const entry = { time: new Date().toISOString(), event, ...fields };
+      admin.record(entry);
+      logger(entry);
     },
   };
+  const wfc = new WfcGateway({
+    helper: wfcHelper,
+    allowedOrigins,
+    log: (event, fields) => bridge.log(event, fields),
+  });
   const wss = new WebSocketServer({
     noServer: true,
     maxPayload: MAX_STATE,
@@ -1988,17 +2712,81 @@ export async function createBridge({
         return reply(200, { status: "ok", rooms: rooms.size });
       if (!secretEqual(request.headers.authorization, `Bearer ${adminToken}`))
         return reply(401, { error: "Unauthorized" });
+      if (path === "/v1/rooms/wfc/sessions" && request.method === "POST") {
+        const result = await wfc.create((await body(request)).owner);
+        const { status, ...value } = result;
+        return reply(status, value);
+      }
+      if (path.startsWith("/v1/rooms/admin/ui/") && request.method === "GET") {
+        const name = path.slice("/v1/rooms/admin/ui/".length) || "index.html";
+        const asset = await adminAsset(name);
+        if (!asset) return reply(404, { error: "Admin asset not found" });
+        response.writeHead(200, {
+          "Content-Type": asset.contentType,
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        });
+        return response.end(asset.body);
+      }
+      if (path === "/v1/rooms/admin" && request.method === "GET")
+        return reply(
+          200,
+          admin.status(bridge, {
+            httpPort: http.address().port,
+            nativePortStart: portStart,
+            nativePortEnd: portEnd,
+            allowedOrigins,
+          }),
+        );
+      if (path === "/v1/rooms/admin/logs" && request.method === "GET") {
+        const after = Number(
+          new URL(request.url, "http://bridge").searchParams.get("after") ?? 0,
+        );
+        if (!Number.isSafeInteger(after) || after < 0)
+          return reply(400, { error: "Invalid log cursor" });
+        return reply(200, admin.logs(after));
+      }
+      if (path === "/v1/rooms/admin/settings" && request.method === "PUT") {
+        const settings = await admin.update(await body(request));
+        bridge.log("admin-settings-updated", settings);
+        return reply(200, settings);
+      }
+      if (path === "/v1/rooms/save-queue" && request.method === "GET")
+        return reply(
+          200,
+          bridge.saves?.list(
+            new URL(request.url, "http://bridge").searchParams.get("room"),
+          ) ?? [],
+        );
+      const saved = path.match(/^\/v1\/rooms\/save-queue\/([a-f0-9]{64})$/);
+      if (saved && request.method === "POST") {
+        const data = await body(request);
+        const entry = bridge.saves?.entries.get(saved[1]);
+        const acknowledged = await bridge.saves?.acknowledge(
+          saved[1],
+          data.revision,
+          data.error,
+        );
+        const room = entry && rooms.get(entry.roomId);
+        if (room && acknowledged && !data.error) room.savesSynced = true;
+        room?.publishSaveStatus();
+        return reply(200, { acknowledged: !!acknowledged });
+      }
       if (path === "/v1/rooms" && request.method === "GET")
         return reply(
           200,
           [...rooms.values()].map((room) => room.metadata()),
         );
       if (path === "/v1/rooms" && request.method === "POST") {
-        if (rooms.size >= maxRooms)
+        if (!admin.settings.roomsEnabled)
+          return reply(409, {
+            error: "New rooms are disabled by the administrator",
+          });
+        if (rooms.size >= admin.settings.maxRooms)
           return reply(409, { error: "Room capacity reached" });
         const data = await body(request);
         const manifest = validateManifest(data);
-        if (rooms.size >= maxRooms)
+        if (rooms.size >= admin.settings.maxRooms)
           return reply(409, { error: "Room capacity reached" });
         if (
           manifest.owner &&
@@ -2082,6 +2870,7 @@ export async function createBridge({
         }
         const hostToken = room.reserve(0, manifest.owner, manifest.nickname, {
           romId: manifest.romId,
+          saveAllowed: manifest.saveAllowed,
           cartridge: manifest.cartridges?.[0],
         });
         bridge.log("room-created", {
@@ -2118,7 +2907,11 @@ export async function createBridge({
         ].find((item) => owner && item.owner === owner);
         if (!member)
           return reply(403, { error: "Join the room before controlling it" });
-        if (!["start-request", "assign", "kick"].includes(data.t))
+        if (
+          !["start-request", "assign", "kick", "disconnect-policy"].includes(
+            data.t,
+          )
+        )
           return reply(400, { error: "Invalid room action" });
         const error = room.control(member, data);
         if (error) return reply(409, { error });
@@ -2139,7 +2932,10 @@ export async function createBridge({
           if (room.peers.has(player))
             return reply(409, { error: "Disconnect RetroArch first" });
           room.reservations.delete(player);
-          if (!room.returnController(player)) room.seats[player] = null;
+          if (!room.returnController(player)) {
+            room.detachCable(player);
+            room.seats[player] = null;
+          }
           room.loadingContent = false;
           room.electHost();
           room.lobby();
@@ -2151,6 +2947,14 @@ export async function createBridge({
           if (error) return reply(409, { error });
         } else if (request.method !== "GET")
           return reply(405, { error: "Method not allowed" });
+        const candidate = { ...item, player };
+        const pending =
+          !room.contentPrepared ||
+          !room.canUseGame(candidate) ||
+          (room.running && !room.matchesGameCartridge(candidate)) ||
+          (room.manifest.collectCartridges &&
+            !room.state &&
+            !room.manifest.nativeAuthority);
         return reply(200, {
           player,
           owner: item.owner,
@@ -2164,7 +2968,7 @@ export async function createBridge({
           tcpPort: room.tcpPort,
           nativePassword: item.nativePassword ?? "",
           cartridges: room.manifest.cartridges,
-          ...(room.manifest.nativeAuthority
+          ...(room.manifest.nativeAuthority && !pending
             ? {
                 initialBatteries: room.initialBatteries(),
                 nativeAuthority: true,
@@ -2173,12 +2977,7 @@ export async function createBridge({
           coreName: room.manifest.coreName,
           coreVersion: room.manifest.coreVersion,
           running: !!room.running,
-          pending:
-            !room.contentPrepared ||
-            (room.running && !room.matchesGameCartridge({ ...item, player })) ||
-            (room.manifest.collectCartridges &&
-              !room.state &&
-              !room.manifest.nativeAuthority),
+          pending,
         });
       }
       if (request.method === "DELETE" && !match[2]) {
@@ -2221,7 +3020,7 @@ export async function createBridge({
           )
         )
           return reply(409, { error: "Account already joined this room" });
-        const slot = switching?.player ?? room.available(native);
+        const slot = switching?.player ?? room.available(native, owner);
         if (slot < 0) return reply(409, { error: "Room is full" });
         const romId = data.romId ?? room.manifest.romId;
         const cartridge = room.manifest.collectCartridges
@@ -2287,6 +3086,8 @@ export async function createBridge({
             nativePassword,
             romId,
             initialBattery,
+            saveAllowed:
+              data.saveAllowed === true || switching?.saveAllowed === true,
             until: expiresAt,
             clientPlatform: data.clientPlatform,
             cartridge,
@@ -2316,6 +3117,7 @@ export async function createBridge({
         }
         const peerToken = room.reserve(slot, owner, nickname, {
           romId,
+          saveAllowed: data.saveAllowed === true,
           cartridge,
         });
         return reply(201, {
@@ -2336,6 +3138,7 @@ export async function createBridge({
   http.requestTimeout = 15000;
   http.headersTimeout = 10000;
   http.on("upgrade", (request, socket, head) => {
+    if (wfc.upgrade(request, socket, head)) return;
     const reject = () => {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
     };
@@ -2384,7 +3187,10 @@ export async function createBridge({
     http,
     address: http.address(),
     close: async () => {
+      wfc.close();
       for (const room of [...rooms.values()]) room.close();
+      await bridge.saves?.pending;
+      await admin.pending;
       for (const ws of wss.clients) ws.terminate();
       await new Promise((resolve) => http.close(resolve));
       wss.close();
@@ -2406,6 +3212,8 @@ if (
     allowedOrigins: (process.env.NETPLAY_BRIDGE_ORIGINS ?? "")
       .split(",")
       .filter(Boolean),
+    saveDirectory: process.env.NETPLAY_BRIDGE_SAVE_DIR || null,
+    wfcHelper: process.env.NETPLAY_WFC_HELPER || null,
   });
   console.info(`Netplay bridge listening on port ${service.address.port}`);
   for (const signal of ["SIGTERM", "SIGINT"])

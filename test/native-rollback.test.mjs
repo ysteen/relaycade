@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { NativePeer } from "../native.mjs";
-import { CMD, words, statePayload } from "../wire.mjs";
+import { CMD, words, statePayload, readStatePayload } from "../wire.mjs";
 
 class Socket extends EventEmitter {
   destroyed = false;
@@ -20,6 +20,254 @@ class Socket extends EventEmitter {
     this.emit("close");
   }
 }
+
+test("native recovery diagnostics correlate state requests with the last CRC and state boundary", (t) => {
+  const room = checkpointRoom(t);
+  const peer = room.peers.get(0);
+  const events = [];
+  room.bridge = { log: (event, fields) => events.push({ event, ...fields }) };
+  room.requestState = () => {
+    throw new Error("Expected compatibility failure");
+  };
+  peer.lastReportedFrame = peer.frameOffset + 100;
+  peer.sendState(0, Buffer.alloc(128, 17));
+  peer.sendCrc(60, 456);
+  assert.throws(
+    () => peer.command(CMD.REQUEST_STATE, Buffer.alloc(0)),
+    /Expected compatibility failure/,
+  );
+  const event = events.find((entry) => entry.event === "native-state-request");
+  assert.equal(event.lastCrcFrame, 60);
+  assert.equal(event.lastCrc, 456);
+  assert.equal(event.lastStateFrame, 0);
+  assert.equal(event.inputFrame, 100);
+  assert(Number.isInteger(event.lastStateCrc));
+  assert(event.lastCrcAgeMs >= 0);
+  assert(!Object.values(event).some((value) => Buffer.isBuffer(value)));
+  peer.prepareRestart();
+  assert.equal(peer.lastCrc, null);
+});
+
+function checkpointRoom(t, host = 0, players = 2) {
+  const room = {
+    manifest: {
+      players,
+      nativeAuthority: true,
+      maxPrediction: 12,
+      stateSize: 128,
+    },
+    generation: 1,
+    host,
+    peers: new Map(),
+    running: true,
+    started: true,
+    saveHost: () => null,
+    saveStatus: () => ({ enabled: false }),
+    notify() {},
+    depart() {},
+    nativeCheckpoint: (peer, frame, state, generation) =>
+      generation === room.generation,
+    input(peer, frame) {
+      assert.equal(frame, peer.nextFrame++);
+    },
+  };
+  for (let player = 0; player < players; player++) {
+    const peer = new NativePeer(room, new Socket(), player);
+    Object.assign(peer, {
+      protocol: 7,
+      compressed: false,
+      phase: "connected",
+      ready: true,
+      playing: true,
+      bootstrapped: true,
+      frameOffset: player + 4,
+      serverPlayer: player === 0 ? 1 : 0,
+      nativeInputsReady: true,
+      nextFrame: 18,
+      nextWireFrame: 18 + player + 4,
+      serverFrame: 20 + player + 4,
+    });
+    room.peers.set(player, peer);
+    t.after(() => peer.close());
+  }
+  return room;
+}
+
+for (const [host, players] of [
+  [0, 2],
+  [1, 2],
+  [2, 4],
+]) {
+  test(`native snapshots preserve wire ordering with host ${host} and ${players} players`, (t) => {
+    const room = checkpointRoom(t, host, players),
+      source = room.peers.get(host);
+    source.requestCheckpoint();
+    assert.equal(
+      source.socket.packets.length,
+      0,
+      "Wait for the source to reach the reserved boundary",
+    );
+    for (const target of room.peers.values()) {
+      if (target === source) continue;
+      const server = target.player === 0 ? 1 : 0;
+      for (const frame of [20, 21, 22]) target.sendInput(frame, server, frame);
+      assert.equal(target.socket.packets.length, 0);
+    }
+    for (const frame of [18, 19, 20])
+      source.command(CMD.INPUT, words(frame + source.frameOffset, 1, 0));
+    assert.deepEqual(
+      source.socket.packets.map((packet) => packet.command),
+      [CMD.REQUEST_STATE],
+    );
+    const bytes = Buffer.alloc(128, 41);
+    source.command(
+      CMD.LOAD_STATE,
+      statePayload(21 + source.frameOffset, bytes, 7, false),
+    );
+    for (const target of room.peers.values()) {
+      if (target === source) continue;
+      const packets = target.socket.packets;
+      assert.deepEqual(
+        packets.map((packet) => packet.command),
+        [CMD.INPUT, CMD.LOAD_STATE, CMD.INPUT, CMD.INPUT],
+      );
+      assert.deepEqual(readStatePayload(packets[1].data, 7, false, 128), {
+        frame: 21 + target.frameOffset,
+        state: bytes,
+      });
+      assert.equal(target.serverFrame, 23 + target.frameOffset);
+      assert.equal(target.statesRelayed, 1);
+      assert.equal(target.checksSent, 0);
+      target.sendInput(20, 0, 99);
+      assert.equal(
+        packets.length,
+        4,
+        "The snapshot supersedes late pre-snapshot input",
+      );
+    }
+  });
+}
+
+test("a snapshot advances a lagging wire server before loading the authoritative state", (t) => {
+  const room = checkpointRoom(t),
+    source = room.peers.get(0),
+    target = room.peers.get(1);
+  source.nextFrame = 21;
+  source.requestCheckpoint();
+  source.command(
+    CMD.LOAD_STATE,
+    statePayload(21 + source.frameOffset, Buffer.alloc(128), 7, false),
+  );
+  assert.deepEqual(
+    target.socket.packets.map((packet) => packet.command),
+    [CMD.NOINPUT, CMD.LOAD_STATE],
+  );
+  assert.equal(
+    target.socket.packets[0].data.readUInt32BE(0),
+    20 + target.frameOffset,
+  );
+  target.prepareRestart();
+  assert.equal(
+    target.checkpointFloor,
+    0,
+    "A new generation starts at logical frame zero",
+  );
+});
+
+test("a future native snapshot advances the receiver's expected input boundary", (t) => {
+  const room = checkpointRoom(t),
+    source = room.peers.get(0),
+    target = room.peers.get(1);
+  source.nextFrame = 101;
+  target.frameOffset = 2;
+  target.nextFrame = 84;
+  target.nextWireFrame = 86;
+  target.serverFrame = 101 + target.frameOffset;
+  source.requestCheckpoint();
+  source.command(
+    CMD.LOAD_STATE,
+    statePayload(101 + source.frameOffset, Buffer.alloc(128), 7, false),
+  );
+  assert.equal(target.nextFrame, 101);
+  assert.equal(target.nextWireFrame, 103);
+  target.command(CMD.INPUT, words(86, 1, 256));
+  assert.equal(
+    target.nextFrame,
+    101,
+    "Discard superseded input still in flight",
+  );
+  target.command(CMD.INPUT, words(103, 1, 512));
+  assert.equal(target.nextFrame, 102);
+  assert.equal(target.nextWireFrame, 104);
+  assert.throws(
+    () => target.command(CMD.INPUT, words(105, 1, 0)),
+    /Native input frames must be sequential/,
+    "A state load must not permit unrelated input gaps",
+  );
+});
+
+test("a native snapshot does not rewind an input stream already ahead of its state", (t) => {
+  const room = checkpointRoom(t),
+    source = room.peers.get(0),
+    target = room.peers.get(1);
+  source.nextFrame = 21;
+  target.nextFrame = 24;
+  target.nextWireFrame = 24 + target.frameOffset;
+  source.requestCheckpoint();
+  source.command(
+    CMD.LOAD_STATE,
+    statePayload(21 + source.frameOffset, Buffer.alloc(128), 7, false),
+  );
+  target.command(CMD.INPUT, words(24 + target.frameOffset, 1, 256));
+  assert.equal(target.nextFrame, 25);
+});
+
+for (const changedGeneration of [false, true]) {
+  test(`an abandoned snapshot ${changedGeneration ? "discards old-generation" : "releases current"} input`, (t) => {
+    const room = checkpointRoom(t),
+      source = room.peers.get(0),
+      target = room.peers.get(1);
+    source.requestCheckpoint();
+    target.sendInput(20, 0, 256);
+    if (changedGeneration) room.generation++;
+    source.close();
+    assert.equal(target.checkpointRelay, null);
+    assert.equal(target.nextFrame, 18);
+    assert.equal(target.nextWireFrame, 18 + target.frameOffset);
+    assert.deepEqual(
+      target.socket.packets.map((packet) => packet.command),
+      changedGeneration ? [] : [CMD.INPUT],
+    );
+  });
+}
+
+test("a paused snapshot waits and an unresponsive source releases other peers", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const room = checkpointRoom(t),
+    source = room.peers.get(0),
+    target = room.peers.get(1);
+  source.nextFrame = 21;
+  source.requestCheckpoint();
+  target.sendInput(20, 0, 256);
+  target.requestCheckpoint();
+  assert.equal(
+    target.checkpointRequested,
+    undefined,
+    "A receiver cannot start a competing snapshot",
+  );
+  room.paused = true;
+  t.mock.timers.tick(10000);
+  assert.equal(source.socket.destroyed, false);
+  assert.equal(target.socket.packets.length, 0);
+  room.paused = false;
+  t.mock.timers.tick(10000);
+  assert.equal(source.socket.destroyed, true);
+  assert.equal(target.checkpointRelay, null);
+  assert.deepEqual(
+    target.socket.packets.map((packet) => packet.command),
+    [CMD.INPUT],
+  );
+});
 
 function fixture(
   t,
@@ -138,6 +386,23 @@ test("native waiting frames stay private and start rebases to the host state", (
   assert.deepEqual(socket.packets.at(-1).data, words(9, 0, 32));
 });
 
+test("a bootstrapped native peer stops lobby keepalives while other players prepare", (t) => {
+  const { peer, room, socket } = fixture(t, {
+    manualStart: true,
+    autoStart: false,
+    lobbyFrames: 3,
+  });
+  for (const frame of [peer.startFrame, peer.startFrame + 1])
+    peer.command(CMD.INPUT, words(frame, 1, 0));
+  assert.equal(peer.bootstrapped, true);
+  assert.equal(peer.playing, false);
+  assert.equal(room.running, false);
+  const packets = socket.packets.length;
+  peer.keepLobbyAlive();
+  assert.equal(socket.packets.length, packets);
+  assert.equal(peer.serverFrame, peer.frameOffset);
+});
+
 test("prediction opt-in uses ordinary playing mode without self input echoes", (t) => {
   const { peer, socket } = fixture(t);
   assert.equal(peer.slave, false);
@@ -243,13 +508,14 @@ test("lockstep default retains native slave sampling and bootstrap echoes", (t) 
   assert.deepEqual(inputs, []);
 });
 
-test("restart drains old native input before rebasing the existing connection", (t) => {
+for (const suspended of [false, true])
+  test(`restart drains old native input before rebasing, paused probe: ${suspended}`, (t) => {
   const { peer, room, socket, inputs } = fixture(t, { manualStart: true });
   peer.command(CMD.INPUT, words(0, 1, 0));
   peer.command(CMD.INPUT, words(1, 1, 8));
   peer.sendInput(0, 0, 0);
   room.running = false;
-  peer.probe = { sent: performance.now() };
+  peer.probe = { sent: performance.now(), suspended };
   let ready = 0;
   room.maybeStart = () => {
     ready++;
@@ -385,6 +651,34 @@ test("native pacing tolerates small leads and respects frame and time limits", (
   assert.equal(socket.packets.length, 2);
 });
 
+for (const hostPlayer of [0, 1])
+  test(`native host ${hostPlayer} can yield to a slower native participant without rebasing input`, (t) => {
+    const { peer, host: reference, room, socket, inputs } = pacingFixture(t);
+    peer.player = room.host = hostPlayer;
+    reference.player = 1 - hostPlayer;
+    reference.kind = "native";
+    room.manifest.nativeAuthority = true;
+    room.peers = new Map([
+      [peer.player, peer],
+      [reference.player, reference],
+    ]);
+    room.nativePacingReference = () => reference;
+    const offset = peer.frameOffset;
+    peer.pace(reference, 0);
+    nativeFrames(peer, 137);
+    reference.frame = 121;
+    peer.pace(reference, 2000);
+    assert.deepEqual(socket.packets, [{ command: CMD.STALL, data: words(14) }]);
+    assert.equal(peer.frameOffset, offset);
+    assert.equal(peer.nextFrame, 137);
+    assert.equal(peer.frame, 136);
+    nativeFrames(peer, 138);
+    assert.equal(inputs.at(-1).frame, 137);
+    assert.equal(inputs.at(-1).player, hostPlayer);
+    assert.equal(peer.nextWireFrame, 138 + offset);
+    assert(!socket.destroyed);
+  });
+
 test("native pacing skips pauses, startup, restart, lockstep and inactive hosts", (t) => {
   const { peer, host, room, socket } = pacingFixture(t);
   const cases = [
@@ -469,4 +763,22 @@ test("bounded stalls converge an eight-frame lead while retaining every sampled 
   assert.equal(inputs.length, peer.nextFrame);
   for (const [frame, input] of inputs.entries())
     assert.deepEqual(input, { frame, player: 1, buttons: frame });
+});
+
+test("paused rejoin waits for an outstanding native checkpoint before requesting its resume snapshot", (t) => {
+  const room = checkpointRoom(t),
+    source = room.peers.get(0);
+  room.resumes = new Map([["paused-rejoin", {}]]);
+  source.checkpointRequested = true;
+  source.checkpointGeneration = room.generation;
+  source.checkpointTargets = [];
+  source.requestResumeSource("paused-rejoin");
+  assert.equal(source.resumeSourceId, undefined);
+  source.command(
+    CMD.LOAD_STATE,
+    statePayload(source.frameOffset + 20, Buffer.alloc(128), 7, false),
+  );
+  assert.equal(source.resumeAfterCheckpoint, null);
+  assert.equal(source.resumeSourceId, "paused-rejoin");
+  assert.equal(source.socket.packets.at(-1).command, CMD.REQUEST_STATE);
 });

@@ -130,6 +130,71 @@ static void verify_save_startup(const void *rom, size_t rom_size) {
     puts("{\"saveStartup\":true,\"players\":[2,3,4],\"frames\":0,\"initialStatePreservesSaves\":true}");
 }
 #endif
+#if !defined(PROBE_SNES)
+static void cable_step(unsigned mask, unsigned frame) {
+    unsigned keys[4];
+    for (unsigned i = 0; i < 4; i++)
+        keys[i] = ((mask & (1u << i)) ? 0 : 0x8000) | ((frame + i) % 7 == 0 ? 0x100 : 0);
+#ifdef PROBE_GBA
+    probe_step(keys[0], keys[1], keys[2], keys[3]);
+#else
+    probe_step(keys[0], keys[1]);
+#endif
+}
+static void verify_cable(const void *rom, size_t rom_size, const char *prefix,
+                         const void *second, size_t second_size) {
+#ifdef PROBE_GBA
+    const unsigned max_players = 4;
+#else
+    const unsigned max_players = 2;
+#endif
+    for (unsigned players = 2; players <= max_players; players++) {
+#ifdef PROBE_GBA
+        require(probe_init(rom, rom_size, players), "Could not load cable fixture");
+#else
+        require(second ? probe_init_pair(rom, rom_size, second, second_size)
+                       : probe_init(rom, rom_size), "Could not load cable fixture");
+#endif
+        unsigned full = (1u << players) - 1;
+        for (unsigned frame = 0; frame < 180; frame++) cable_step(full, frame);
+        size_t size = probe_size();
+        unsigned char *before = malloc(size), *after = malloc(size), *replayed = malloc(size);
+        require(before && after && replayed, "Cable probe allocation failed");
+        require(probe_save(before, size), "Could not capture initial cable state");
+        char initial_suffix[64]; snprintf(initial_suffix, sizeof(initial_suffix), "p%u-initial", players);
+        write_bytes(prefix, initial_suffix, before, size);
+        for (unsigned mask = 0; mask <= full; mask++) {
+            require(probe_save(before, size), "Could not save connected topology");
+            for (unsigned frame = 0; frame < 12; frame++) cable_step(mask, frame);
+            require(probe_save(after, size), "Could not save detached topology");
+#ifdef PROBE_GBA
+            const size_t runtime = size - 8 - players * (64 + 131072);
+            require(after[runtime] == mask, "Core did not detach the selected cables");
+            for (unsigned player = 0; player < players; player++) {
+                size_t at = runtime + 8 + player * (64 + 131072) + 8;
+                unsigned old_frame, new_frame;
+                memcpy(&old_frame, before + at, 4); memcpy(&new_frame, after + at, 4);
+                require(new_frame > old_frame, "Cable change froze a console");
+            }
+#else
+            require(after[size - 16] == mask, "SameBoy did not record cable topology");
+#endif
+            require(probe_load(before, size), "Could not roll back across cable change");
+            for (unsigned frame = 0; frame < 12; frame++) cable_step(mask, frame);
+            require(probe_save(replayed, size) && !memcmp(after, replayed, size), "Cable rollback state mismatch");
+            char suffix[64]; snprintf(suffix, sizeof(suffix), "p%u-mask%u", players, mask);
+            write_bytes(prefix, suffix, after, size);
+            /* Restore a disconnected snapshot from a different live topology. */
+            cable_step(full ^ mask, 0);
+            require(probe_load(after, size), "Could not restore disconnected topology");
+            require(probe_save(replayed, size) && !memcmp(after, replayed, size), "Disconnected topology restore mismatch");
+            for (unsigned frame = 0; frame < 8; frame++) cable_step(full, frame);
+        }
+        free(before); free(after); free(replayed); probe_close();
+        printf("{\"players\":%u,\"masks\":%u,\"cableRollback\":true}\n", players, full + 1);
+    }
+}
+#endif
 int main(int argc, char **argv) {
     require(argc >= 3, "Usage: probe CORE info | CORE ROM OUTPUT_PREFIX [INITIAL_STATE|-] [SECOND_ROM]");
 #ifdef _WIN32
@@ -153,6 +218,15 @@ int main(int argc, char **argv) {
     require(argc >= 4, "Output prefix is required");
     size_t rom_size;
     void *rom = read_bytes(argv[2], &rom_size);
+#if !defined(PROBE_SNES)
+    if (!strcmp(argv[3], "cable")) {
+        require(argc > 4, "Cable output prefix is required");
+        size_t second_size = 0;
+        unsigned char *second = argc > 5 ? read_bytes(argv[5], &second_size) : NULL;
+        verify_cable(rom, rom_size, argv[4], second, second_size);
+        free(second); free(rom); return 0;
+    }
+#endif
 #ifdef PROBE_GBA
     if (!strcmp(argv[3], "save-startup")) {
         verify_save_startup(rom, rom_size);

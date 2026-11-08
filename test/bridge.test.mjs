@@ -262,6 +262,11 @@ async function native(room, options = {}) {
       .digest("hex");
     socket.write(packet(CMD.PASSWORD, Buffer.from(hash)));
   }
+  if (options.denied) {
+    assert.equal((await queue.next()).command, CMD.NAK);
+    socket.destroy();
+    return { socket, queue };
+  }
   assert.equal((await queue.next()).command, CMD.INFO);
   socket.write(
     packet(CMD.INFO, infoPayload({ ...manifest, ...options.manifest })),
@@ -292,6 +297,55 @@ const preparedManifest = {
     crc32: manifest.contentCrc,
   })),
 };
+
+test("native credentials cannot expose prepared SRAM or initial saves to a replacement account", async (t) => {
+  const f = await fixture(t);
+  const { data: room } = await f.api("/v1/rooms", {
+    ...preparedManifest,
+    nativeAuthority: true,
+    maxPrediction: 12,
+  });
+  await f.web(room.hostPath);
+  const stored = f.bridge.rooms.get(room.id);
+  stored.seats[0] = 0;
+  stored.state = Buffer.alloc(128, 22);
+  stored.sram = Buffer.from([22]);
+  async function prepare(owner) {
+    const result = await f.api(`/v1/rooms/${room.id}/native`, {
+      owner,
+      romId: 11,
+      clientPlatform: "windows-x86_64",
+      battery: "Fg==",
+    });
+    assert.equal(result.status, 201);
+    const route = `/v1/rooms/${room.id}/native/${result.data.credential}`;
+    assert.equal((await f.api(route, { seat: 1 }, "PATCH")).status, 200);
+    return { ...result.data, route };
+  }
+  const original = await prepare("original-owner");
+  const initial = (await f.api(original.route)).data;
+  assert.equal(initial.pending, false);
+  assert.equal(initial.initialBatteries[1], "Fg==");
+  await f.api(original.route, undefined, "DELETE");
+  const stranger = await prepare("new-owner");
+  const blocked = (await f.api(stranger.route)).data;
+  assert.equal(blocked.pending, true);
+  assert.equal(blocked.initialBatteries, undefined);
+  assert.equal(stored.metadata().saveOwners[1].owner, "original-owner");
+  await native(
+    { ...room, password: stranger.nativePassword },
+    { denied: true },
+  );
+  assert.equal(stored.peers.has(1), false);
+  assert.equal(stored.closed, false);
+  await f.api(stranger.route, undefined, "DELETE");
+  const returning = await prepare("original-owner");
+  assert.equal(returning.player, original.player);
+  assert.equal((await f.api(returning.route)).data.pending, false);
+  const client = await native({ ...room, password: returning.nativePassword });
+  t.after(() => client.socket.destroy());
+  assert.equal(stored.peers.get(1).owner, "original-owner");
+});
 
 test("native authority starts two RetroArch clients without a web core and transfers hosting", async (t) => {
   const f = await fixture(t);
@@ -428,24 +482,26 @@ test("native authority starts two RetroArch clients without a web core and trans
   clients[0].socket.write(
     packet(
       CMD.LOAD_STATE,
-      statePayload(authority.frameOffset + 90, seed, 7, false),
+      statePayload(authority.frameOffset + 91, seed, 7, false),
     ),
   );
-  const check = await nativeMessage(clients[1], CMD.CRC);
-  assert.deepEqual(
-    check.payload,
-    words(stored.peers.get(1).frameOffset + 90, crc32(seed)),
-  );
+  const check = await nativeMessage(clients[1], CMD.LOAD_STATE);
+  assert.deepEqual(readStatePayload(check.payload, 7, false, 128), {
+    frame: stored.peers.get(1).frameOffset + 91,
+    state: seed,
+  });
+  assert.equal(stored.peers.get(1).statesRelayed, 1);
+  assert.equal(stored.peers.get(1).checksSent, 0);
   await f.api(`/v1/rooms/${room.id}/leave`, { owner: "host" });
   assert.equal(stored.host, 1);
   assert.equal(stored.progress, 90);
   const guest = await f.api(`/v1/rooms/${room.id}/join`, {
-    owner: "browser",
+    owner: "host",
     romId: 11,
     cartridge: settings.cartridges[0],
   });
   const web = await f.web(guest.data.peerPath);
-  await control("browser", { t: "assign", player: 0, seat: 0 });
+  await control("host", { t: "assign", player: 0, seat: 0 });
   web.send({ t: "game-open", generation: stored.generation });
   web.send({
     t: "content-ready",
@@ -461,10 +517,38 @@ test("native authority starts two RetroArch clients without a web core and trans
       statePayload(stored.peers.get(1).frameOffset + 90, seed, 7, false),
     ),
   );
-  let resumed;
-  do resumed = await web.queue.next();
-  while (resumed.t !== "resume");
-  assert.equal(resumed.f, 90);
+  let prepared;
+  do prepared = await web.queue.next();
+  while (prepared.t !== "prepare");
+  assert.equal(prepared.nativeState, true);
+  assert.equal(prepared.restarting, true);
+  assert.equal(prepared.generation, stored.generation);
+  let transfer;
+  do transfer = await web.queue.next();
+  while (transfer.t !== "state");
+  assert.equal(transfer.f, 0);
+  assert.deepEqual(await web.queue.next(), seed);
+  const authorityAfterResume = stored.peers.get(1);
+  assert(authorityAfterResume.restarting);
+  assert.equal(stored.running, false);
+  await nativeMessage(clients[1], CMD.PING);
+  for (let pong = 0; pong < authorityAfterResume.restartPongs; pong++)
+    clients[1].socket.write(packet(CMD.PONG));
+  web.send({
+    t: "ready",
+    revision: transfer.revision,
+    generation: stored.generation,
+  });
+  const restored = await nativeMessage(clients[1], CMD.LOAD_STATE);
+  assert.deepEqual(
+    readStatePayload(restored.payload, 7, false, 128).state,
+    seed,
+  );
+  let started;
+  do started = await web.queue.next();
+  while (started.t !== "start");
+  assert.equal(started.generation, stored.generation);
+  assert.equal(stored.running, true);
   assert.equal(stored.host, 1);
   await f.api(`/v1/rooms/${room.id}/leave`, { owner: "guest" });
   assert.equal(stored.host, 0);

@@ -38,15 +38,18 @@ static void poll(void) {}
 static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id) {
     return port < 2 && id < 16 && (buttons[port] & (1u << id)) != 0;
 }
-int probe_init(const void *rom, size_t size) {
+int probe_init_pair(const void *first, size_t first_size, const void *second, size_t second_size) {
     retro_set_environment(environment);
     retro_set_video_refresh(video);
     retro_set_audio_sample_batch(audio);
     retro_set_input_poll(poll);
     retro_set_input_state(input);
     retro_init();
-    struct retro_game_info games[2] = {{NULL, rom, size, NULL}, {NULL, rom, size, NULL}};
+    struct retro_game_info games[2] = {{NULL, first, first_size, NULL}, {NULL, second, second_size, NULL}};
     return retro_load_game_special(0x101, games, 2);
+}
+int probe_init(const void *rom, size_t size) {
+    return probe_init_pair(rom, size, rom, size);
 }
 void probe_step(unsigned a, unsigned b) {
     buttons[0] = a; buttons[1] = b;

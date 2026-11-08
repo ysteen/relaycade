@@ -5,5 +5,17 @@
 !native.mjs
 !native-launch.mjs
 !wire.mjs
+!wfc.mjs
+!wfc/
+!wfc/slirp-gateway.c
+!scripts/
+!scripts/build-wfc-gateway.sh
+!admin.mjs
+!save-extract.mjs
+!save-outbox.mjs
+!client/
+!client/link-core.js
+!admin-ui/
+!admin-ui/**
 !LICENSE
 !NOTICE

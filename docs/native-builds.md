@@ -1,17 +1,42 @@
 # Windows and Android core builds
 
 The RomM adapter distributes the same pinned core versions as its WASM packages:
-SameBoy SBR2, mGBA Splitscreen SPST4 and Snes9x 2d4cce69. No RetroArch application
+SameBoy SBR3, mGBA Splitscreen SPST5 and Snes9x 2d4cce69. No RetroArch application
 patch is required. The browser suggests a download for the visitor's OS and CPU;
 the installed RetroArch app can have a different architecture, so manual
 selection remains available. Downloading a core does not occupy a room slot.
 
-For mGBA Splitscreen, also download `mgba_splitscreen_libretro.info` and copy it
+Windows room launches automatically download the matching DLL and `.info` file,
+verify their SHA-256 hashes, and configure an isolated core directory. No manual
+core installation is needed. Verified downloads are reused; corrupt cached files
+are downloaded again. Existing RetroArch installations and settings are preserved.
+
+SameBoy room sessions require **RetroArch 1.22.2 or later**. The launcher checks
+`retroarch.exe --version` before reusing an installation. An older or
+unrecognized installed version stops preparation with instructions to update
+that installation. It does not download a replacement. If no installation is
+found, it prepares the pinned portable 1.22.2 runtime automatically, without
+administrator rights. An explicit `-RetroArch` path receives the same version
+check. mGBA Splitscreen and Snes9x retain their existing installation selection.
+
+RetroArch 1.21.0 does not provide the target sample-rate API used by this SameBoy
+build. Its fallback is 2,097,152 Hz, while the web build and the qualified 1.22.2
+frontend use 48,000 Hz. Those clients can exchange states but diverge in APU
+scheduling after advancing, causing a CRC failure on Windows-to-web return.
+Setting `audio_out_rate` alone cannot fix a frontend that lacks that API.
+`test/windows-runtime-compatibility.ps1` checks selection and fallback without
+starting a game; optional `-Legacy` and `-Modern` executable paths also exercise
+the actual version probe. After updating an already registered launcher, download
+the launcher ZIP and run **Register Launcher.cmd** once to replace its local script.
+
+For manual SameBoy or mGBA Splitscreen setup, also download the matching `.info` file and copy it
 to **Settings → Directory → Core Info** in RetroArch. Keep its filename unchanged.
 Close RetroArch, remove `core_info.cache` from that directory if present, and
 reopen it to rebuild the extension list. Select the installed core under
 **Load Core**, then open the ROM under **Load Content**. Installing a DLL alone
 does not register this custom core's GBA extension in the shared content filter.
+The patched SameBoy info declares deterministic savestates. An unrelated stock
+info file can disable netplay even when the loaded DLL supports rollback.
 
 The native mGBA package applies `patches/mgba-native-startup.patch`: one GBA
 loaded through **Load Content** boots the **Players per ROM** setting directly
@@ -70,9 +95,13 @@ The helper searches the remembered path, PATH, registered installations and comm
 
 Each Windows computer must trust the RomM server's HTTPS certificate. For a private CA, the RomM adapter can include `RomM-CA.cer` and **Install Certificate.cmd** in the launcher ZIP. Run the installer once on the computer running RetroArch; it verifies the bundled hash and adds the public root to **Current User > Trusted Root Certification Authorities**, skipping an already trusted root. Normal playback does not install certificates. Publicly trusted HTTPS needs no additional installation. A browser certificate exception does not grant trust to PowerShell. The launcher does not require administrator rights or bypass certificate validation. Download errors show the endpoint and underlying TLS, DNS, proxy, connection or timeout error, with launch credentials and URL secrets removed.
 
-The Windows mGBA builds also apply `mgba-local-player-view.patch`. The helper observes the standard MODE packet's own-client flag and device bitmask, writes the assigned console to a per-session file, and passes its path through the child process's `ROMM_NETPLAY_PLAYER_FILE` environment variable. The core uses its existing focus layout and matching audio source, polling the tiny file every 15 frames. Before an assignment it presents silence and a blank screen. This display preference is excluded from SPST4 state and does not change the compatibility version. Ordinary manual launches without that variable retain their layout options. The broker protocol and stock RetroArch executable are unchanged.
+The Windows builds apply `sameboy-local-player-view.patch` and `mgba-local-player-view.patch`. The helper observes the standard MODE packet's own-client flag and device bitmask, writes the assigned console to a per-session file, and passes its path through the child process's `ROMM_NETPLAY_PLAYER_FILE` environment variable. Each core selects that screen and audio source, polling the tiny file every 15 frames. Before an assignment it presents silence and a blank screen. This display preference is excluded from SBR3/SPST5 state and does not change the compatibility version. Ordinary manual launches without that variable retain their layout options. The broker protocol and stock RetroArch executable are unchanged. Existing registered launchers need one download and registration to receive script changes; core updates are then fetched by hash automatically.
+
+The Windows launcher passes the local view through a temporary process variable while creating RetroArch, then restores its previous value, including on startup failure. It does not enumerate `ProcessStartInfo.EnvironmentVariables`: some Windows launch environments contain both `Path` and `PATH`, which .NET Framework rejects as duplicate dictionary keys. User and system environment settings are unchanged. Run `test/windows-session-process.ps1 -Launcher client/windows-session.ps1` to check child inheritance and cleanup without an emulator.
 
 Display verification compared P1/P2 output with the corresponding composite pixels, checked an unassigned blank screen and identical emulation states after 120 frames across all views. MODE parsing covers P1-P4 and preserves relayed state bytes. These bounded Windows checks do not repeat native rejoin qualification.
+
+On 2026-11-07, the SameBoy Windows x64 display probe used distinct Gold and Silver cartridges from the user's library. P1/P2 pixels and audio matched the corresponding full-view outputs; waiting and invalid seats were blank and silent, reassignment worked, and complete SBR3 state bytes stayed identical. Two unmodified RetroArch 1.22.2 processes then started through the real Windows launcher with empty caches, downloaded their matching core and info, and passed 1,250 frames and two native state checkpoints without a resync. This covered initial connection, not game trades, live rejoin or Android. Each process tree was capped at 1.5 GiB, two CPUs and 60 seconds. Use `test/run-windows-sameboy.ps1 -Workspace <workspace> -Content1 <rom> -Content2 <rom> -Mode view|launch` with the prebuilt probe and bounded runner.
 
 Windows x64 verification on 2026-11-02 used distinct diagnostic cartridges, 120-frame restore/replay equality and a real RetroArch 1.22.2 plus WASM-host run: 300 confirmed frames, five state checks, preserved guest SRAM, 294 link receipts, over ten seconds waiting in the lobby and two total members. Windows x86/ARM64 builds passed ABI/export/hash inspection; their runtime was not repeated. These results do not establish commercial-game trading, native rejoin or audio quality.
 
@@ -138,8 +167,58 @@ The helper sets `pause_nonactive = "false"` for room play. Session settings prec
 
 ### Native-first rooms
 
-Account-bound rollback rooms opt into `nativeAuthority`. The relay selects RetroArch before web, obtains its initial snapshot with the stock REQUEST_STATE command, and forwards input/state traffic. This does not make RetroArch listen on a public port. Native-only rooms need no web emulator; the authenticated browser room remains the control surface. Active participants take precedence over waiting rejoins. On departure, another active RetroArch takes over, then an active web player. Browser peers use bounded, muted catch-up steps against native frame progress; other native peers use STALL pacing. Native-only verification requests one bounded state snapshot every 600 frames.
+Account-bound rollback rooms opt into `nativeAuthority`. The relay selects RetroArch before web, obtains its initial snapshot with the stock REQUEST_STATE command, and forwards input/state traffic. This does not make RetroArch listen on a public port. Native-only rooms need no web emulator; the authenticated browser room remains the control surface. Active participants take precedence over waiting rejoins. On departure, another active RetroArch takes over, then an active web player. Browser peers use bounded, muted catch-up steps against native frame progress; native-only rooms pace against a stable slower active participant, including the host when it is ahead. The authoritative host and snapshot ownership do not change. Native-only synchronization requests a bounded host snapshot every 600 frames and relays it in input order. Requested native states can include prediction and must not be used as confirmed CRC checkpoints. See [save synchronization and its Windows qualification](save-sync.md).
 
-Launcher manifest v3 stages all selected cartridge saves in `saves/.netplay`, the directory stock RetroArch uses for rollback clients. Its configured save directory stays at `saves`, so RetroArch appends the child directory only once. Version 3 rejects older helpers that would seed the wrong directory. Update the reusable launcher registration once and create a fresh room. A playing web peer remains the source of per-account progress uploads; native-only automatic uploads are not implemented. New transport/client tests use simulated cores and protocol peers, not native emulator qualification.
+Launcher manifest v3 stages all selected cartridge saves in `saves/.netplay`, the directory stock RetroArch uses for rollback clients. Its configured save directory stays at `saves`, so RetroArch appends the child directory only once. Version 3 rejects older helpers that would seed the wrong directory. Update the reusable launcher registration once and create a fresh room. With the durable queue enabled, the broker extracts cartridge saves from native snapshots and RomM writes them to each original account without a playing web peer. See [server save synchronization](save-sync.md) for the serial protocol tests and separate bounded Windows qualification.
 
 `mgba-native-save-init.patch` initializes deferred cartridge memory when the frontend first queries it, before the first frame. RetroArch restores SRAM at that point; returning null until `retro_run` would discard every selected save. The patch changes neither SPST4 nor the compatibility version, and applies to native builds only. `test/windows-save-startup.ps1` runs the core API probe in a bounded Windows job without executing game frames. It checks independent P1-P4 saves, fresh loads, and preservation in the initial snapshot; it does not qualify gameplay or rejoin.
+
+## Server timing diagnostics
+
+`game-timing` records each playing member's input frame, the host frame,
+`inputLeadFrames`, both RTT samples, pause state and outgoing queued bytes every
+two seconds. Native frame counters are protocol input counters, not measured
+render times. A positive lead can require rollback when host input arrives; it
+is not an input-to-display latency measurement.
+
+`native-paced` records the requested stall. `native-pace-observed` records the
+lead and frame advances 250 ms later, so a request can be distinguished from its
+effect. `native-state-sent` and `native-state-request` correlate generation,
+state boundary, frame offset and the last CRC when a frontend requests recovery.
+These events contain scalar diagnostics, never ROM, battery or snapshot bytes.
+
+Managed Windows pause/resume waits for the local `GET_STATUS` acknowledgement
+before forwarding the next state packet. This prevents a state request or load
+from overtaking a pending local resume. Use the matched DLL and `.info` pair
+installed by the launcher, and update registered helpers to use this ordering.
+
+
+### Windows stall timing
+
+Room sessions enable `vrr_runloop_enable` before the inherited configuration.
+This uses RetroArch's software frame timer, including cached frames during
+STALL; it does not require a VRR monitor and does not change the installation's
+video driver or configuration. Without this timer, cached-frame stalls can be
+consumed without the requested elapsed time. Both Windows participants need the
+updated registered launcher; core DLLs and save formats are unchanged.
+
+Pacing in native-only rooms may hold an ahead host as well as an ahead guest.
+A reference changes only when another active participant is more than three
+frames behind, so ordinary packet ordering cannot repeatedly reset settling.
+Waiting members do not affect pacing. Mixed rooms retain their existing host
+clock and browser catch-up path. Pacing never drops input or changes frame
+identities, offsets or checksum boundaries.
+
+On 2026-11-08, bounded Windows RetroArch 1.22.2 runs with mGBA Splitscreen and the
+two diagnostic cartridges reproduced an eight-frame STALL removing zero lead
+frames with the inherited display clock. Enabling the frame timer removed eight
+to nine frames in the same 300 ms observation window. A timer-only run retained
+a 16-frame guest deficit; allowing host pacing reduced a 15-frame deficit to two
+frames after four seconds. No emulator ran in WSL. These protocol-counter checks
+do not measure input-to-display latency, trading, long-session or Android behavior.
+
+Use `test/run-windows-continuation.ps1 -Workspace <workspace> -Scenario pacing`
+with the prepared Windows runtime and bounded runner to check real elapsed
+STALL behavior and recovery on both sides. It uses isolated settings and ports,
+a matched DLL/info pair, muted WASAPI audio and the same 1.5 GiB, two-CPU,
+60-second process-tree limit as the other Windows qualification cases.

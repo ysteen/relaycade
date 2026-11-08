@@ -28,6 +28,7 @@ for (const name of [
   "bridge-session.js",
   "bridge-calibration.js",
   "link-core.js",
+  "wfc-session.js",
 ]) {
   const source = await readFile(resolve(root, "client", name));
   hashes[name] = createHash("sha256").update(source).digest("hex");

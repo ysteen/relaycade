@@ -11,15 +11,15 @@ import {
   packet,
   readString,
   readStatePayload,
+  crc32,
   statePayload,
   syncPayload,
   words,
 } from "./wire.mjs";
 
-// Keep a small input lead without letting a faster frontend run away. RetroArch
-// accepts at most 60 requested stall frames and spaces server requests by 120
-// frames. Also bound wall time so a burst of web progress cannot stack requests.
-const PACING_LEAD = 3;
+// Keep a small input lead without letting a faster frontend run away. Bound
+// correction size and frequency so bursts of progress cannot stack stalls.
+export const PACING_LEAD = 3;
 const PACING_TARGET = 2;
 const PACING_INTERVAL_FRAMES = 120;
 const PACING_INTERVAL_MS = 2000;
@@ -49,6 +49,8 @@ export class NativePeer {
     this.lastReportedFrame = 0;
     this.pendingChecks = new Map();
     this.checksSent = 0;
+    this.statesRelayed = 0;
+    this.checkpointFloor = 0;
     this.buttons = 0;
     this.serverFrame = 0;
     this.lobbyFrames = 0;
@@ -81,6 +83,8 @@ export class NativePeer {
     socket.on("close", () => {
       room.pendingNative?.delete(this);
       clearTimeout(this.timeout);
+      clearTimeout(this.checkpointTimeout);
+      this.releaseCheckpoint();
       this.log("native-closed", {
         reason: this.closeReason ?? "Peer closed the connection",
         durationMs: Date.now() - this.connectedAt,
@@ -150,7 +154,8 @@ export class NativePeer {
     if (this.phase === "nick") {
       if (command !== CMD.NICK || data.length !== 32)
         throw new Error("Expected RetroArch nickname");
-      this.nickname = readString(data) || "RetroArch";
+      this.managedPause = readString(data).startsWith("RMP1:");
+      this.nickname = readString(data).replace(/^RMP1:/, "") || "RetroArch";
       this.send(CMD.NICK, fixedString(this.room.manifest.nickname));
       this.phase = this.salt ? "password" : "info";
       if (!this.salt) this.send(CMD.INFO, infoPayload(this.room.manifest));
@@ -199,6 +204,13 @@ export class NativePeer {
       throw new Error("Native handshake is waiting for the web host state");
     switch (command) {
       case CMD.PLAY:
+        if (
+          this.room.manifest.disconnectPolicy === "pause" &&
+          !this.managedPause
+        )
+          throw new Error(
+            "Update and register the Windows launcher to use pause on disconnect",
+          );
         if (
           data.length !== 4 ||
           this.ready ||
@@ -256,7 +268,15 @@ export class NativePeer {
             this.compressed,
             this.room.manifest.stateSize,
           );
-          this.room.nativeCheckpoint(this, frame - this.frameOffset, state);
+          const accepted = this.room.nativeCheckpoint(
+            this,
+            frame - this.frameOffset,
+            state,
+            this.checkpointGeneration,
+          );
+          this.releaseCheckpoint(
+            accepted ? { frame: frame - this.frameOffset, state } : null,
+          );
           return;
         }
         if (this.resumeSourceId) {
@@ -319,6 +339,20 @@ export class NativePeer {
       case CMD.REQUEST_STATE:
         if (data.length) throw new Error("Invalid state request");
         if (this.room.manifest.nativeAuthority && !this.playing) return;
+        this.log("native-state-request", {
+          generation: this.room.generation,
+          inputFrame: Math.max(0, this.lastReportedFrame - this.frameOffset),
+          frameOffset: this.frameOffset,
+          serverFrame: this.serverFrame,
+          checkpointFloor: this.checkpointFloor,
+          lastCrcFrame: this.lastCrc?.frame ?? null,
+          lastCrc: this.lastCrc?.crc ?? null,
+          lastCrcAgeMs: this.lastCrc
+            ? Math.round(performance.now() - this.lastCrc.at)
+            : null,
+          lastStateFrame: this.lastState?.frame ?? null,
+          lastStateCrc: this.lastState?.crc ?? null,
+        });
         if (!this.bootstrapping) this.room.requestState(this);
         return;
       case CMD.PING:
@@ -371,6 +405,10 @@ export class NativePeer {
       (!this.room.state && !this.room.manifest.nativeAuthority)
     )
       return;
+    if (this.room.canReceiveGame && !this.room.canReceiveGame(this)) {
+      this.drop("Wait for the host to prepare a new game with your own save");
+      return;
+    }
     // RetroArch reserves wire client zero for the server, independently of room membership.
     this.serverPlayer = this.player === 0 ? 1 : 0;
     this.send(
@@ -399,7 +437,8 @@ export class NativePeer {
       this.phase !== "connected" ||
       !this.ready ||
       this.playing ||
-      this.bootstrapping
+      this.bootstrapping ||
+      this.bootstrapped
     )
       return;
     // RetroArch spectators time out after ten seconds without input frames.
@@ -487,26 +526,151 @@ export class NativePeer {
   }
 
   requestResumeSource(id) {
+    if (this.checkpointRequested) {
+      this.resumeAfterCheckpoint = id;
+      return;
+    }
     this.resumeSourceId = id;
     this.send(CMD.REQUEST_STATE);
   }
 
   requestCheckpoint() {
     if (
+      this.room.paused ||
+      this.checkpointRelay ||
       this.checkpointRequested ||
       this.restartSourceRequested ||
       this.resumeSourceId
     )
       return;
     this.checkpointRequested = true;
-    this.send(CMD.REQUEST_STATE);
-    this.checkpointTimeout = setTimeout(() => {
+    this.checkpointGeneration = this.room.generation;
+    this.checkpointSent = false;
+    this.checkpointTargets = [];
+    if (
+      this.room.manifest.nativeAuthority &&
+      this.player === this.room.host &&
+      this.room.saveHost() === null
+    ) {
+      for (const other of this.room.peers.values()) {
+        if (other === this || other.kind !== "native" || !other.playing)
+          continue;
+        other.checkpointRelay = {
+          source: this,
+          generation: this.room.generation,
+          inputs: [],
+        };
+        this.checkpointTargets.push(other);
+      }
+    }
+    this.checkpointMinFrame = Math.max(
+      0,
+      ...this.checkpointTargets.map(
+        (other) => other.serverFrame - other.frameOffset,
+      ),
+    );
+    this.sendCheckpointRequest();
+    const timeout = () => {
+      if (this.room.paused) {
+        this.checkpointTimeout = setTimeout(timeout, 10000);
+        this.checkpointTimeout.unref();
+        return;
+      }
       this.log("native-checkpoint-timeout");
-    }, 10000);
+      if (this.room.saveStatus?.().enabled)
+        this.room.saveFailed(
+          new Error("The RetroArch save snapshot timed out"),
+        );
+      this.releaseCheckpoint();
+      this.drop("Native state snapshot timed out");
+    };
+    this.checkpointTimeout = setTimeout(timeout, 10000);
     this.checkpointTimeout.unref();
   }
 
+  sendCheckpointRequest() {
+    if (
+      !this.checkpointRequested ||
+      this.checkpointSent ||
+      this.nextFrame < this.checkpointMinFrame
+    )
+      return;
+    this.checkpointSent = true;
+    this.send(CMD.REQUEST_STATE);
+  }
+
+  releaseCheckpoint(snapshot = null) {
+    if (snapshot) {
+      this.checkpointFloor = Math.max(this.checkpointFloor, snapshot.frame);
+      this.serverFrame = Math.max(
+        this.serverFrame,
+        snapshot.frame + this.frameOffset,
+      );
+    }
+    for (const other of this.checkpointTargets ?? []) {
+      const relay = other.checkpointRelay;
+      if (relay?.source !== this) continue;
+      other.checkpointRelay = null;
+      if (
+        relay.generation !== this.room.generation ||
+        !other.playing ||
+        other.socket.destroyed
+      )
+        continue;
+      if (snapshot) {
+        const { frame, state } = snapshot;
+        // REQUEST_STATE rebases RetroArch's rollback history. Relay its state
+        // before any later wire input, rather than comparing predicted bytes
+        // with another client's confirmed history as a CRC checkpoint.
+        for (const input of relay.inputs)
+          if (input[0] < frame) other.sendInput(...input);
+        if (other.serverFrame > frame + other.frameOffset)
+          throw new Error(
+            "Native snapshot preceded the reserved input boundary",
+          );
+        for (
+          let wire = other.serverFrame;
+          wire < frame + other.frameOffset;
+          wire++
+        )
+          other.send(CMD.NOINPUT, words(wire));
+        other.checkpointFloor = frame;
+        other.pendingChecks.clear();
+        other.sendState(frame, state);
+        // A future state makes RetroArch skip its earlier local input frames.
+        if (frame > other.nextFrame) {
+          const previousFrame = other.nextFrame;
+          other.nextFrame = frame;
+          other.nextWireFrame = frame + other.frameOffset;
+          other.log("native-input-rebased", {
+            previousFrame,
+            frame,
+            wireFrame: other.nextWireFrame,
+            generation: this.room.generation,
+          });
+        }
+        other.statesRelayed++;
+        other.log("native-state-relayed", {
+          frame,
+          sourcePlayer: this.player,
+          generation: this.room.generation,
+        });
+      }
+      for (const input of relay.inputs)
+        if (!snapshot || input[0] >= snapshot.frame) other.sendInput(...input);
+    }
+    this.checkpointTargets = [];
+    if (this.resumeAfterCheckpoint) {
+      const id = this.resumeAfterCheckpoint;
+      this.resumeAfterCheckpoint = null;
+      if (this.room.resumes.has(id)) this.requestResumeSource(id);
+    }
+  }
+
   prepareRestart() {
+    this.lastCrc = null;
+    this.checkpointRelay = null;
+    this.checkpointFloor = 0;
     this.restarting = true;
     this.restartReady = false;
     this.restartPongs = this.probe ? 2 : 1;
@@ -564,13 +728,21 @@ export class NativePeer {
     if (buttons > 65535) throw new Error("Invalid native joypad input");
     // The socket owns the slot; the claimed player number is not authority.
     if (wireFrame < this.nextWireFrame) return;
-    if (wireFrame !== this.nextWireFrame)
+    if (wireFrame !== this.nextWireFrame) {
+      this.log("native-input-gap", {
+        expectedWireFrame: this.nextWireFrame,
+        receivedWireFrame: wireFrame,
+        checkpointFloor: this.checkpointFloor,
+        generation: this.room.generation,
+      });
       throw new Error("Native input frames must be sequential");
+    }
     this.nextWireFrame++;
     this.lastReportedFrame = wireFrame;
     this.flushChecks();
     if (wireFrame < this.frameOffset) return;
     const frame = wireFrame - this.frameOffset;
+    this.frame = frame;
     if (this.nativeInputsReady) this.room.input(this, frame, buttons);
     else {
       if (this.pendingInputs.length >= 120)
@@ -582,6 +754,7 @@ export class NativePeer {
       this.bootstrapped = true;
       this.room.finishStart();
     }
+    this.sendCheckpointRequest();
   }
 
   flushInputs() {
@@ -607,7 +780,9 @@ export class NativePeer {
         !(this.room.manifest.nativeAuthority && host?.kind === "native")) ||
       host === this ||
       !host.playing ||
-      host.player !== this.room.host ||
+      host !==
+        (this.room.nativePacingReference?.() ??
+          this.room.peers.get(this.room.host)) ||
       this.room.peers.get(host.player) !== host
     ) {
       this.pacing = null;
@@ -619,6 +794,23 @@ export class NativePeer {
       return;
     }
     const lead = this.nextFrame - host.frame;
+    if (this.pacing.pending && now - this.pacing.pending.at >= 250) {
+      const previous = this.pacing.pending;
+      this.pacing.pending = null;
+      this.log("native-pace-observed", {
+        generation: this.room.generation,
+        hostPlayer: this.room.host,
+        referencePlayer: host.player,
+        previousLead: previous.lead,
+        currentLead: lead,
+        hostAdvanced:
+          this.room.peers.get(this.room.host)?.frame - previous.hostFrame,
+        referenceAdvanced: host.frame - previous.referenceFrame,
+        nativeAdvanced: this.nextFrame - previous.nativeFrame,
+        requestedStall: previous.frames,
+        elapsedMs: Math.round(now - previous.at),
+      });
+    }
     if (
       lead <= PACING_LEAD ||
       host.frame - this.pacing.frame < PACING_INTERVAL_FRAMES ||
@@ -628,19 +820,49 @@ export class NativePeer {
     const frames = Math.min(PACING_MAX_STALL, lead - PACING_TARGET);
     this.pacing.frame = host.frame;
     this.pacing.at = now;
+    this.pacing.pending = {
+      at: now,
+      lead,
+      frames,
+      hostFrame: this.room.peers.get(this.room.host)?.frame,
+      referenceFrame: host.frame,
+      nativeFrame: this.nextFrame,
+    };
     // Pause execution, not the input stream: frame offsets and state/checksum
     // identities must remain unchanged throughout the current game.
     this.send(CMD.STALL, words(frames));
     this.log("native-paced", {
-      hostPlayer: host.player,
-      hostFrame: host.frame,
+      hostPlayer: this.room.host,
+      hostFrame: this.room.peers.get(this.room.host)?.frame,
+      referencePlayer: host.player,
+      referenceFrame: host.frame,
       nativeFrame: this.nextFrame,
       leadFrames: lead,
       stallFrames: frames,
+      generation: this.room.generation,
+      hostKind: this.room.peers.get(this.room.host)?.kind,
+      referenceKind: host.kind,
+      pingMs: this.ping ?? null,
+      hostPingMs: this.room.peers.get(this.room.host)?.ping ?? null,
+      referencePingMs: host.ping ?? null,
     });
   }
 
+  setRoomPaused(paused) {
+    this.send(
+      paused ? CMD.PAUSE : CMD.RESUME,
+      paused ? fixedString("Waiting for player") : undefined,
+    );
+  }
+
   sendInput(frame, player, buttons) {
+    if (frame < this.checkpointFloor) return;
+    if (this.checkpointRelay) {
+      if (this.checkpointRelay.inputs.length >= 4096)
+        throw new Error("Native snapshot input queue exceeded");
+      this.checkpointRelay.inputs.push([frame, player, buttons]);
+      return;
+    }
     this.send(
       CMD.INPUT,
       words(frame + this.frameOffset, this.wirePlayer(player), buttons),
@@ -660,12 +882,26 @@ export class NativePeer {
     for (const [frame, crc] of this.pendingChecks) {
       if (frame > this.lastReportedFrame) continue;
       this.send(CMD.CRC, words(frame, crc));
+      this.lastCrc = {
+        frame: frame - this.frameOffset,
+        crc,
+        at: performance.now(),
+      };
       this.pendingChecks.delete(frame);
       this.checksSent++;
     }
   }
 
   sendState(frame, state) {
+    if (this.room.canReceiveGame && !this.room.canReceiveGame(this)) return;
+    this.lastState = { frame, crc: crc32(state) };
+    this.log("native-state-sent", {
+      generation: this.room.generation,
+      frame,
+      wireFrame: frame + this.frameOffset,
+      bytes: state.length,
+      crc: this.lastState.crc,
+    });
     this.send(
       CMD.LOAD_STATE,
       statePayload(
@@ -695,6 +931,7 @@ export class NativePeer {
     clearTimeout(this.timeout);
     clearTimeout(this.sourceTimeout);
     clearTimeout(this.checkpointTimeout);
+    this.releaseCheckpoint();
     this.socket.destroy();
   }
 }
