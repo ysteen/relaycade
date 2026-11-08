@@ -189,7 +189,13 @@ try {
       const record=(direction,bytes)=>{if(bytes[12]!==8||bytes[13]!==0||testNetwork.packets.length>=100)return;
         const ip=at=>Array.from(bytes.slice(at,at+4)).join('.');
         const port=at=>(bytes[at]<<8)|bytes[at+1];
-        testNetwork.packets.push({direction,time:Date.now(),source:ip(26),destination:ip(30),protocol:bytes[23],sourcePort:port(34),destinationPort:port(36),tcpFlags:bytes[23]===6?bytes[47]:undefined,length:bytes.length});};
+        let dnsQuestion;
+        if(bytes[23]===17 && (port(34)===53 || port(36)===53) && bytes.length>54) {
+          const labels=[]; let p=54;
+          while(p<bytes.length && bytes[p]>0 && bytes[p]<64) {const n=bytes[p++]; labels.push(String.fromCharCode(...bytes.subarray(p,p+n))); p+=n;}
+          dnsQuestion=labels.join('.');
+        }
+        testNetwork.packets.push({direction,time:Date.now(),source:ip(26),destination:ip(30),protocol:bytes[23],sourcePort:port(34),destinationPort:port(36),tcpFlags:bytes[23]===6?bytes[47]:undefined,dnsQuestion,length:bytes.length});};
       const send=session.send.bind(session), receive=session.receive.bind(session);
       session.send=bytes=>{testNetwork.sent++; record('out',bytes); if(bytes[12]===8&&bytes[13]===0){const ip=Array.from(bytes.slice(30,34)).join('.'); testNetwork.destinations[ip]=(testNetwork.destinations[ip]||0)+1;} return send(bytes);};
       session.receive=()=>{const bytes=receive(); if(bytes){testNetwork.received++; record('in',bytes);} return bytes;};
@@ -317,6 +323,8 @@ try {
   assert.ok(details.started, details.text);
   assert.ok(details.frame > 30);
   assert.equal(details.wfc, 1);
+  if (mode === "wfc")
+    assert.ok(details.network?.sent > 0, "The scenario did not reach Nintendo WFC");
   if (userSave) assert.equal(details.userSave?.path, details.savePath);
 } catch (error) {
   await writeFile(

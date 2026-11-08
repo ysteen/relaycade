@@ -174,6 +174,31 @@ No browser exceptions were recorded. Evidence is in the private
 files passed, including nine input regression cases. Physical Android validation
 and WFC authentication remain separate checks.
 
+### Retest on 2026-11-08
+
+The DS-only RomM session and settings routes were restored after a common adapter
+update removed their registration. Local API admission and the LAN HTTPS gateway
+were checked before testing the game.
+
+Windows Chrome then loaded the same Korean Diamond cartridge and battery save.
+From an offline Mystery Gift menu checkpoint, **Receive via Nintendo WFC**
+completed authentication through `nas.nintendowifi.net` and fetched an event
+listing from `dls1.ilostmymind.xyz`. The game displayed the Regigigas event and
+asked whether to receive it. The test stopped before accepting a gift. This
+qualifies that game's online authentication and listing path, not trading,
+battling, matchmaking or Android.
+
+The firmware connection test uses a different name, `nas.test.nintendowifi.net`.
+Kaeru DNS still returned `95.217.77.151` for that name; the guest sent repeated
+TCP SYN packets without a reply during the observation window. Normal game
+authentication resolved to `178.62.43.212` and succeeded. A pending firmware
+connection test therefore does not establish failure of the game's login path.
+
+The process tree remained limited to 1.5 GiB, two CPUs and 60 seconds. Original
+battery bytes were unchanged, and the isolated browser was closed. Private
+screenshots and packet metadata are in
+`result/wfc-qualification/retest-20261108/qualification.json`.
+
 ## References
 
 - [Official melonDS DS documentation](https://docs.libretro.com/library/melonds_ds/)
