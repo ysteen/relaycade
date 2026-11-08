@@ -139,6 +139,23 @@ def inspect(binary, target, machine, llvm):
     }
 
 
+def normalize_runtime_manifest(directory, core):
+    """Describe the shipped runtime files separately from build intermediates."""
+    path = directory / "manifest.json"
+    manifest = json.loads(path.read_text())
+    if "platform" not in manifest:
+        manifest["buildArtifactSha256"] = manifest["sha256"]
+    manifest.update(platform="linux-x86_64", nativeCore=f"{core}_libretro.so",
+                    webBundle=f"{core}-wasm.data", license="license.txt",
+                    buildInstructions="BUILD.txt")
+    manifest["sha256"] = {
+        file.name: hashlib.sha256(file.read_bytes()).hexdigest()
+        for file in sorted(directory.iterdir())
+        if file.is_file() and file.name != "manifest.json"
+    }
+    path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
 def install_core_info(romm, catalog):
     for source in sorted(CORE_INFO.glob("*_libretro.info")):
         core = source.name.removesuffix("_libretro.info")
@@ -261,6 +278,8 @@ def main():
             }
         catalog[core]["downloads"] = downloads
     install_core_info(args.romm, catalog)
+    for core in args.cores:
+        normalize_runtime_manifest(args.romm / "custom-emulatorjs/data/cores/compat/rollback" / DIRECTORIES[core], core)
     catalog_path.write_text(json.dumps(catalog, indent=2) + "\n")
     (args.artifacts.parent / "artifact-audit.json").write_text(
         json.dumps(audit, indent=2) + "\n"
