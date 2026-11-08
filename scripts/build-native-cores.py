@@ -24,18 +24,18 @@ TARGETS = {
 CORES = {
     "sameboy": {
         "name": "SameBoy",
-        "version": "1.0.4c87d256-rollback2",
+        "version": "1.0.4c87d256-cable1",
         "revision": "c87d256",
-        "profile": "SBR2",
+        "profile": "SBR3",
         "archive": "SameBoy-c87d256.tar.gz",
         "sha256": "67a65d1f13e8a132bff3955bdf98ad67c5049552721f9417c9f597ae0039b6a6",
         "patch": "sameboy-rollback-state.patch",
     },
     "mgba_splitscreen": {
         "name": "mGBA Splitscreen",
-        "version": "0.1.0-f1d5975-rollback2",
+        "version": "0.1.0-f1d5975-cable1",
         "revision": "f1d5975d77285f77affbfe64b7050ebd5c4b6a77",
-        "profile": "SPST4",
+        "profile": "SPST5",
         "archive": "mgba-splitscreen-f1d5975.tar.gz",
         "sha256": "8374542f8a042a1ad661a5e886083f3cfcf84fe79c1e471dae5eb6c432b88958",
         "patch": "mgba-rollback-state.patch",
@@ -196,6 +196,9 @@ def build(core, target, args):
             platform_patch = REPO / "patches/mgba-native-platforms.patch"
             if "set(SP_CORE_SRC" not in (source / "CMakeLists.txt").read_text():
                 run(["patch", "-d", source, "-p1", "--input", platform_patch], log)
+            if "0.1.0-f1d5975-cable1" not in wrapper.read_text():
+                run(["patch", "-d", source, "-p1", "--input",
+                     REPO / "patches/mgba-cable.patch"], log)
             flags = [
                 "-DCMAKE_BUILD_TYPE=Release",
                 "-DLIBMGBA_ONLY=ON",
@@ -259,8 +262,14 @@ def build(core, target, args):
                 "LTO=",
             ]
             if core == "sameboy":
+                if "0x33524253" not in (source / "libretro/libretro.c").read_text():
+                    run(["patch", "-d", source, "-p1", "--input",
+                         REPO / "patches/sameboy-cable.patch"], log)
+                if not android and "ROMM_NETPLAY_PLAYER_FILE" not in (source / "libretro/libretro.c").read_text():
+                    run(["patch", "-d", source, "-p1", "--input",
+                         REPO / "patches/sameboy-local-player-view.patch"], log)
                 flags += [
-                    "GIT_VERSION=c87d256-rollback2",
+                    "GIT_VERSION=c87d256-cable1",
                     f"BOOTROMS_DIR={args.bootroms}",
                 ]
                 binary = source / filename
@@ -310,9 +319,16 @@ def build(core, target, args):
         manifest["zlib"] = "1.3.2 (static)"
         shutil.copy2(work / "zlib-source/LICENSE", dest / "zlib-LICENSE.txt")
     if "patch" in config:
+        manifest["inputProfile"] = "link-cable-r3-v1"
+        manifest["cablePatchSha256"] = digest(REPO / "patches" / ("mgba-cable.patch" if core == "mgba_splitscreen" else "sameboy-cable.patch"))
         manifest.update(
             stateProfile=config["profile"],
             patchSha256=digest(REPO / "patches" / config["patch"]),
+        )
+    if core == "sameboy" and not android:
+        manifest["localPlayerView"] = "netplay-mode-file-v1"
+        manifest["localPlayerViewPatchSha256"] = digest(
+            REPO / "patches/sameboy-local-player-view.patch"
         )
     if core == "mgba_splitscreen":
         manifest["multiRomPatchSha256"] = digest(REPO / "patches/mgba-multi-rom.patch")

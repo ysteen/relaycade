@@ -5,5 +5,12 @@
 !native.mjs
 !native-launch.mjs
 !wire.mjs
+!admin.mjs
+!save-extract.mjs
+!save-outbox.mjs
+!client/
+!client/link-core.js
+!admin-ui/
+!admin-ui/**
 !LICENSE
 !NOTICE

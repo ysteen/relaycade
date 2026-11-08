@@ -10,8 +10,9 @@ COMPAT_ARCHIVE="${COMPAT_ARCHIVE:-$TASK_ROOT/result/netplay-interop/stock-core/d
 COMPAT_BOOTROMS="${COMPAT_BOOTROMS:-$TASK_ROOT/result/netplay-interop/stock-core/SameBoy-c87d256/build/bin/BootROMs}"
 COMPAT_FRONTEND="${COMPAT_FRONTEND:-$TASK_ROOT/build/compile/retroarch-netplay}"
 COMPAT_PATCH="$COMPAT_REPO/patches/sameboy-rollback-state.patch"
+COMPAT_CABLE_PATCH="$COMPAT_REPO/patches/sameboy-cable.patch"
 COMPAT_PROBE="$COMPAT_REPO/test/libretro-probe.c"
-COMPAT_VERSION=c87d256-rollback2
+COMPAT_VERSION=c87d256-cable1
 if [[ -e "$COMPAT_WORK" ]]; then
   printf 'Refusing to reuse existing work directory: %s\n' "$COMPAT_WORK" >&2
   exit 1
@@ -40,6 +41,7 @@ mkdir -p -- "$COMPAT_WORK/native-source" "$COMPAT_WORK/wasm-source"
 for kind in native wasm; do
   tar -xzf "$COMPAT_ARCHIVE" --strip-components=1 -C "$COMPAT_WORK/$kind-source"
   patch -d "$COMPAT_WORK/$kind-source" -p1 --input "$COMPAT_PATCH"
+  patch -d "$COMPAT_WORK/$kind-source" -p1 --input "$COMPAT_CABLE_PATCH"
 done
 make -C "$COMPAT_WORK/native-source/libretro" -j2 GIT_VERSION="$COMPAT_VERSION" BOOTROMS_DIR="$COMPAT_BOOTROMS"
 export EM_CONFIG="$COMPAT_EMSDK/.emscripten"
@@ -75,8 +77,8 @@ core = {'name': 'sameboy', 'extensions': ['gb', 'gbc'], 'options': {}, 'save': '
         'repo': 'https://github.com/libretro/SameBoy',
         'retroarchOpts': [{'name': 'audio_out_rate', 'title': 'Audio sample rate',
                           'options': ['48000'], 'default': '48000', 'isString': False}]}
-build = {'minimumEJSVersion': '4.3.0', 'version': 'sameboy-c87d256-rollback2',
-         'sameboy': 'c87d256', 'stateProfile': 'SBR2', 'stockCore': False}
+build = {'minimumEJSVersion': '4.3.0', 'version': 'sameboy-c87d256-cable1',
+         'sameboy': 'c87d256', 'stateProfile': 'SBR3', 'stockCore': False}
 for name, value in [('core.json', core), ('build.json', build)]:
     (out / name).write_text(json.dumps(value) + '\n')
 PY
@@ -91,9 +93,11 @@ import hashlib, json, sys
 root, patch = map(Path, sys.argv[1:])
 paths = ['native-source/sameboy_libretro.so', 'native-probe.so', 'sameboy_libretro.a', 'core-probe.mjs', 'core-probe.wasm']
 paths += [str(p.relative_to(root)) for p in (root / 'web').glob('*')] if (root / 'web').exists() else []
-manifest = {'core': 'SameBoy', 'version': '1.0.4c87d256-rollback2', 'stateProfile': 'SBR2',
+manifest = {'core': 'SameBoy', 'version': '1.0.4c87d256-cable1', 'stateProfile': 'SBR3',
             'patchSha256': hashlib.sha256(patch.read_bytes()).hexdigest(),
             'sha256': {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths}}
+manifest['inputProfile'] = 'link-cable-r3-v1'
+manifest['cablePatchSha256'] = hashlib.sha256((patch.parent / 'sameboy-cable.patch').read_bytes()).hexdigest()
 (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 PY
 printf 'Native core: %s\nWASM probe: %s\n' "$COMPAT_WORK/native-source/sameboy_libretro.so" "$COMPAT_WORK/core-probe.mjs"

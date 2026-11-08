@@ -2,7 +2,10 @@ FROM node:24-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+RUN mkdir -p /data/saves && chown -R node:node /data
 COPY --chown=node:node *.mjs ./
+COPY --chown=node:node admin-ui ./admin-ui
+COPY --chown=node:node client/link-core.js ./client/link-core.js
 COPY --chown=node:node LICENSE NOTICE ./
 USER node
 EXPOSE 8080 55435-55442

@@ -13,6 +13,7 @@ COMPAT_PATCH="$COMPAT_REPO/patches/mgba-rollback-state.patch"
 COMPAT_STARTUP_PATCH="$COMPAT_REPO/patches/mgba-native-startup.patch"
 COMPAT_SAVE_INIT_PATCH="$COMPAT_REPO/patches/mgba-native-save-init.patch"
 COMPAT_MULTI_ROM_PATCH="$COMPAT_REPO/patches/mgba-multi-rom.patch"
+COMPAT_CABLE_PATCH="$COMPAT_REPO/patches/mgba-cable.patch"
 COMPAT_PROBE="$COMPAT_REPO/test/mgba-core-probe.c"
 if [[ -e "$COMPAT_WORK" ]]; then
   printf 'Refusing to reuse existing work directory: %s\n' "$COMPAT_WORK" >&2
@@ -37,6 +38,9 @@ old = 'add_library(mgba_splitscreen_libretro SHARED ${CORE_SRC} ${SP_SRC} ${SP_S
 assert s.count(old) == 1
 p.write_text(s.replace(old, 'add_library(mgba_splitscreen_libretro STATIC ${CORE_SRC} ${SP_SRC} ${SP_SIO_SRC} ${CORE_VFS_SRC})'))
 PY
+for kind in native wasm; do
+  patch -d "$COMPAT_WORK/$kind-source" -p1 --input "$COMPAT_CABLE_PATCH"
+done
 COMPAT_CMAKE_FLAGS=(
   -DCMAKE_BUILD_TYPE=Release -DLIBMGBA_ONLY=ON -DBUILD_LIBRETRO_SPLITSCREEN=ON
   -DBUILD_SHARED=OFF -DBUILD_STATIC=OFF -DENABLE_DEBUGGERS=OFF -DENABLE_SCRIPTING=OFF
@@ -88,7 +92,7 @@ import json, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 core = {'name': 'mgba_splitscreen', 'extensions': ['gba'], 'options': {}, 'save': 'srm', 'repo': 'https://github.com/Spuds0588/mgba-splitscreen'}
-build = {'minimumEJSVersion': '4.3.0', 'version': 'mgba-f1d5975-rollback2', 'stateProfile': 'SPST4', 'stockCore': False, 'frontendInputs': 4, 'orderedCartridges': True}
+build = {'minimumEJSVersion': '4.3.0', 'version': 'mgba-f1d5975-cable1', 'stateProfile': 'SPST5', 'stockCore': False, 'frontendInputs': 4, 'orderedCartridges': True}
 for name, value in [('core.json', core), ('build.json', build)]:
     (out / name).write_text(json.dumps(value) + '\n')
 PY
@@ -103,7 +107,7 @@ import hashlib, json, sys
 root, patch, startup_patch, multi_rom_patch, save_init_patch = map(Path, sys.argv[1:])
 paths = ['native/mgba_splitscreen_libretro.so', 'native-probe.so', 'wasm/mgba_splitscreen_libretro.a', 'core-probe.mjs', 'core-probe.wasm']
 paths += [str(p.relative_to(root)) for p in (root / 'web').glob('*')] if (root / 'web').exists() else []
-manifest = {'core': 'mGBA Splitscreen', 'version': '0.1.0-f1d5975-rollback2', 'stateProfile': 'SPST4',
+manifest = {'core': 'mGBA Splitscreen', 'version': '0.1.0-f1d5975-cable1', 'stateProfile': 'SPST5',
             'sourceRevision': 'f1d5975d77285f77affbfe64b7050ebd5c4b6a77',
             'patchSha256': hashlib.sha256(patch.read_bytes()).hexdigest(),
             'startupPatchSha256': hashlib.sha256(startup_patch.read_bytes()).hexdigest(),
@@ -113,6 +117,8 @@ manifest = {'core': 'mGBA Splitscreen', 'version': '0.1.0-f1d5975-rollback2', 's
             'orderedCartridges': True,
             'nativeStartup': 'configured-players-v1',
             'sha256': {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths}}
+manifest['inputProfile'] = 'link-cable-r3-v1'
+manifest['cablePatchSha256'] = hashlib.sha256((patch.parent / 'mgba-cable.patch').read_bytes()).hexdigest()
 (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 PY
 printf 'Native core: %s\nWASM probe: %s\n' "$COMPAT_WORK/native/mgba_splitscreen_libretro.so" "$COMPAT_WORK/core-probe.mjs"

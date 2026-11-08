@@ -60,7 +60,7 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
   }
   function connect(path, player, seed) {
     const socket = new WebSocket(base.replace("http:", "ws:") + path);
-    const core = new Core();
+    let core = new Core();
     const actions = [],
       errors = [];
     let lobby;
@@ -77,11 +77,14 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
         latency = value;
       },
       onError: (error) => errors.push(error.message),
+      onContent: async () => (core = new Core()),
     });
     clients.push(client);
     return {
       client,
-      core,
+      get core() {
+        return core;
+      },
       actions,
       errors,
       get lobby() {
@@ -212,8 +215,14 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
   }
   host.client.startGame();
   await until(() =>
+    [host, guest, third].every(({ client }) => client.gameClosed),
+  );
+  for (const { client } of [host, guest, third]) client.openGame();
+  await until(() => host.lobby.canStart);
+  host.client.startGame();
+  await until(() =>
     [host, guest, third].every(
-      ({ client }) => client.started && client.generation === 2,
+      ({ client }) => client.started && client.generation === 3,
     ),
   );
   for (const { core } of [host, guest, third])
@@ -232,8 +241,14 @@ test("unassigned lobby enforces own-slot selection and host start, preserving sa
   await until(() => guest.lobby.canStart);
   guest.client.startGame();
   await until(() =>
+    [guest, third, replacement].every(({ client }) => client.gameClosed),
+  );
+  for (const { client } of [guest, third, replacement]) client.openGame();
+  await until(() => guest.lobby.canStart);
+  guest.client.startGame();
+  await until(() =>
     [guest, third, replacement].every(
-      ({ client }) => client.started && client.generation === 3,
+      ({ client }) => client.started && client.generation === 5,
     ),
   );
   await advance([guest, third, replacement], 70);

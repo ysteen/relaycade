@@ -82,27 +82,37 @@ async function setup(t, overrides = {}) {
   assert.equal(created.status, 201);
   const room = bridge.rooms.get(created.data.id);
   const events = [];
+  function core() {
+    const adapter = new MemoryCore();
+    if (room.manifest.system === "snes")
+      adapter.profile = { core: "snes9x", memoryIds: [0], sharedSave: true };
+    return adapter;
+  }
   async function web(path, player, seed, wait = 0) {
     const socket = new WebSocket(base.replace("http:", "ws:") + path);
-    const link = new BridgeConnection(null, socket, {
-      player,
-      players: 2,
-      battery: new Uint8Array(512).fill(seed),
-      onError(error) {
-        events.push({ player, error: error.message });
+    const link = new BridgeConnection(
+      room.manifest.collectCartridges ? null : core(),
+      socket,
+      {
+        player,
+        players: 2,
+        battery: new Uint8Array(512).fill(seed),
+        onError(error) {
+          events.push({ player, error: error.message });
+        },
+        onActionError(message) {
+          events.push({ player, action: message });
+        },
+        async onContent(packet) {
+          events.push({
+            player,
+            cartridges: packet.cartridges.map((rom) => rom.romId),
+          });
+          await delay(wait);
+          return core();
+        },
       },
-      onActionError(message) {
-        events.push({ player, action: message });
-      },
-      async onContent(packet) {
-        events.push({
-          player,
-          cartridges: packet.cartridges.map((rom) => rom.romId),
-        });
-        await delay(wait);
-        return new MemoryCore();
-      },
-    });
+    );
     t.after(() => link.stop());
     await until(() => link.manualStart);
     return link;
@@ -431,6 +441,172 @@ test("pending Windows cartridges are collected by seat and scoped downloads stay
   replacement.assignPlayer(joined.data.player, 0);
   await until(() => room.canStart());
   host.startGame();
+  await until(() => host.gameClosed && replacement.gameClosed);
+  host.openGame();
+  replacement.openGame();
+  await until(() => room.canStart());
+  host.startGame();
   await until(() => replacement.started && host.started);
   assert(host.adapter.memory(0).every((value) => value === 33));
+});
+
+for (const closeGames of [false, true]) {
+  test(`a new account cannot inherit a same-cartridge slot${closeGames ? " after all games close" : " during play"}`, async (t) => {
+    const { api, room, host, web } = await setup(t);
+    const joined = await api(`/v1/rooms/${room.id}/join`, {
+      owner: "original-owner",
+      romId: 2,
+      cartridge: cartridge(2),
+    });
+    const guest = await web(joined.data.peerPath, joined.data.player, 22);
+    host.assignPlayer(0, 0);
+    guest.assignPlayer(1, 1);
+    await until(() => room.canStart());
+    host.startGame();
+    await until(() => host.started && guest.started);
+    for (let frame = 0; frame < 4; frame++) {
+      host.tick(0);
+      guest.tick(0);
+      await delay(10);
+    }
+    assert(guest.adapter.memory(256).every((value) => value === 22));
+    if (closeGames) {
+      host.closeGame();
+      guest.closeGame();
+      await until(() => !room.running);
+    }
+    guest.stop();
+    await until(() => !room.peers.has(1));
+    const next = await api(`/v1/rooms/${room.id}/join`, {
+      owner: "new-owner",
+      romId: 2,
+      cartridge: cartridge(2),
+    });
+    const replacement = await web(next.data.peerPath, next.data.player, 33);
+    let binaryPackets = 0;
+    replacement.socket.on("message", (_, binary) => {
+      if (binary) binaryPackets++;
+    });
+    replacement.assignPlayer(next.data.player, 1);
+    await until(() => room.seats[1] === 1);
+    replacement.openGame();
+    replacement.send({
+      t: "content-ready",
+      size: 1028,
+      contentCrc: 1,
+      resume: true,
+    });
+    await delay(30);
+    assert(!replacement.started);
+    assert.equal(replacement.adapter, null);
+    assert.equal(binaryPackets, 0);
+    assert.equal(room.resumes.size, 0);
+    assert(room.metadata().requiresNewGame);
+    assert.equal(room.metadata().saveOwners[1].owner, "original-owner");
+    assert(
+      room.members().find((member) => member.owner === "new-owner")
+        .waitingForNewGame,
+    );
+    host.startGame();
+    await until(
+      () => host.gameClosed && replacement.gameClosed && !room.contentPrepared,
+    );
+    assert.equal(room.gameOwners, null);
+    host.openGame();
+    replacement.openGame();
+    await until(() => room.canStart());
+    host.startGame();
+    await until(() => host.started && replacement.started);
+    assert(replacement.adapter.memory(256).every((value) => value === 33));
+    assert.equal(room.metadata().saveOwners[1].owner, "new-owner");
+  });
+}
+
+test("SNES requires a fresh game for a new account and keeps the host's shared save", async (t) => {
+  const { api, room, host, web } = await setup(t, {
+    system: "snes",
+    coreName: "Snes9x",
+    collectCartridges: false,
+    cartridges: [cartridge(1)],
+    stateSize: 1028,
+  });
+  const joined = await api(`/v1/rooms/${room.id}/join`, {
+    owner: "original-owner",
+    romId: 1,
+  });
+  const guest = await web(joined.data.peerPath, 1, 22);
+  host.assignPlayer(0, 0);
+  guest.assignPlayer(1, 1);
+  await until(() => room.canStart());
+  host.startGame();
+  await until(() => host.started && guest.started);
+  guest.stop();
+  await until(() => !room.peers.has(1));
+  const next = await api(`/v1/rooms/${room.id}/join`, {
+    owner: "new-owner",
+    romId: 1,
+  });
+  const replacement = await web(next.data.peerPath, 1, 33);
+  replacement.assignPlayer(1, 1);
+  replacement.openGame();
+  await until(() => room.needsNewGame());
+  assert(!replacement.started);
+  assert(replacement.adapter.memory(0).every((value) => value === 0));
+  host.startGame();
+  await until(() => host.gameClosed && replacement.gameClosed);
+  assert.equal(room.state, null);
+  host.openGame();
+  replacement.openGame();
+  await until(() => room.canStart());
+  host.startGame();
+  await until(() => host.started && replacement.started);
+  assert(replacement.adapter.memory(0).every((value) => value === 11));
+  assert.equal(room.metadata().saveOwners[1].owner, "new-owner");
+});
+
+test("the original account resumes its own slot and late state responses recheck ownership", async (t) => {
+  const { api, room, host, web } = await setup(t);
+  const joined = await api(`/v1/rooms/${room.id}/join`, {
+    owner: "original-owner",
+    romId: 2,
+    cartridge: cartridge(2),
+  });
+  const guest = await web(joined.data.peerPath, 1, 22);
+  host.assignPlayer(0, 0);
+  guest.assignPlayer(1, 1);
+  await until(() => room.canStart());
+  host.startGame();
+  await until(() => host.started && guest.started);
+  guest.stop();
+  await until(() => !room.peers.has(1));
+  const rejoined = await api(`/v1/rooms/${room.id}/join`, {
+    owner: "original-owner",
+    romId: 2,
+    cartridge: cartridge(2),
+  });
+  assert.equal(rejoined.data.player, 1);
+  const returning = await web(rejoined.data.peerPath, 1, 44);
+  assert.equal(
+    room.members().find((member) => member.owner === "original-owner")
+      .waitingForNewGame,
+    false,
+  );
+  returning.assignPlayer(1, 1);
+  returning.openGame();
+  await until(() => returning.started);
+  assert(returning.adapter.memory(256).every((value) => value === 22));
+  assert(!room.metadata().requiresNewGame);
+  const target = room.peers.get(1),
+    source = room.peers.get(0);
+  room.resumes.set("late-response", {
+    id: "late-response",
+    peer: target,
+    source,
+    generation: room.generation,
+  });
+  target.owner = "different-account";
+  target.playing = false;
+  room.completeResume(source, "late-response", 0, host.adapter.save());
+  assert(!target.playing);
+  assert(!room.resumes.has("late-response"));
 });

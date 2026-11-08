@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Netplay Bridge administration</title>
+    <link rel="stylesheet" href="admin.css" />
+  </head>
+  <body>
+    <main class="admin-panel">
+      <header class="admin-heading">
+        <div>
+          <h1>Multiplayer administration</h1>
+          <p class="hint">Server settings, saves and connection logs</p>
+        </div>
+        <div class="form-actions">
+          <a id="application-link" href="/" target="_blank" rel="noopener"
+            >Open application</a
+          ><label
+            >Theme<select id="theme">
+              <option value="">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select></label
+          >
+        </div>
+      </header>
+      <section id="access" aria-labelledby="access-title">
+        <h2 id="access-title">Checking administrator access…</h2>
+        <p id="access-message" role="status">Using your application login.</p>
+        <div class="form-actions">
+          <a id="signin-link" href="/" target="_blank" rel="noopener"
+            >Sign in to application</a
+          ><button id="check-access">Check access</button>
+        </div>
+      </section>
+      <section id="dashboard" hidden>
+        <div class="admin-heading">
+          <p id="account" class="hint"></p>
+          <p id="last-updated" class="hint"></p>
+        </div>
+        <p id="admin-status" role="status" aria-live="polite"></p>
+        <nav class="admin-tabs" aria-label="Administration" role="tablist">
+          <button
+            id="settings-tab"
+            role="tab"
+            aria-selected="true"
+            aria-controls="settings-panel"
+          >
+            Settings
+          </button>
+          <button
+            id="logs-tab"
+            role="tab"
+            aria-selected="false"
+            aria-controls="logs-panel"
+            tabindex="-1"
+          >
+            Logs
+          </button>
+        </nav>
+        <section
+          id="settings-panel"
+          role="tabpanel"
+          aria-labelledby="settings-tab"
+        >
+          <div class="admin-stats" aria-label="Service status">
+            <article>
+              <span>Bridge</span><strong id="bridge-status">Checking…</strong>
+            </article>
+            <article>
+              <span>Rooms</span><strong id="active-rooms">0</strong>
+            </article>
+            <article>
+              <span>Pending saves</span><strong id="pending-saves">0</strong>
+            </article>
+            <article>
+              <span>Save errors</span><strong id="failed-saves">0</strong>
+            </article>
+          </div>
+          <div class="admin-columns">
+            <form id="network-form">
+              <fieldset>
+                <legend>Connection addresses</legend>
+                <dl id="addresses" class="admin-addresses"></dl>
+                <label
+                  >Public bridge URL<input
+                    id="public-url"
+                    type="url"
+                    maxlength="2048"
+                    autocomplete="off"
+                /></label>
+                <label
+                  >RetroArch hostname or IP<input
+                    id="native-host"
+                    type="text"
+                    maxlength="255"
+                    autocomplete="off"
+                /></label>
+                <p class="hint">
+                  Leave a field blank to use the deployment setting. Changes
+                  apply to new connections. Listener ports, allowed browser
+                  origins and HTTPS certificates are configured in the
+                  deployment.
+                </p>
+                <div class="form-actions">
+                  <button type="submit" class="primary">Save addresses</button
+                  ><button id="reset-addresses" type="button">
+                    Use deployment settings
+                  </button>
+                </div>
+              </fieldset>
+            </form>
+            <form id="runtime-form">
+              <fieldset>
+                <legend>Multiplayer settings</legend>
+                <label class="checkbox-label"
+                  ><input id="rooms-enabled" type="checkbox" /> Allow new
+                  rooms</label
+                >
+                <label
+                  >Maximum simultaneous rooms<input
+                    id="max-rooms"
+                    type="number"
+                    min="1"
+                    max="8"
+                    required
+                /></label>
+                <label
+                  >Snapshot request interval (seconds)<input
+                    id="save-interval"
+                    type="number"
+                    min="5"
+                    max="120"
+                    required
+                /></label>
+                <p class="hint">
+                  Existing games stay connected when new rooms are disabled or
+                  the limit is lowered. Native verification checkpoints also
+                  collect saves during play.
+                </p>
+                <p id="persistence" class="hint"></p>
+                <div class="form-actions">
+                  <button id="save-runtime" type="submit" class="primary">
+                    Save multiplayer settings
+                  </button>
+                </div>
+              </fieldset>
+            </form>
+          </div>
+          <section class="admin-section" aria-labelledby="queue-title">
+            <div class="admin-heading">
+              <h2 id="queue-title">Save synchronization</h2>
+              <button id="sync-saves">Sync pending saves</button>
+            </div>
+            <p class="hint">
+              Your library application processes the queue. Failed saves stay on
+              the server for retry. Existing conflicting saves are preserved.
+            </p>
+            <p id="queue-empty">No saves waiting for synchronization.</p>
+            <ul id="save-queue" class="admin-records"></ul>
+          </section>
+          <section class="admin-section" aria-labelledby="rooms-title">
+            <h2 id="rooms-title">Active rooms</h2>
+            <p id="admin-rooms-empty">No active rooms.</p>
+            <ul id="admin-rooms" class="admin-records"></ul>
+          </section>
+        </section>
+        <section
+          id="logs-panel"
+          role="tabpanel"
+          aria-labelledby="logs-tab"
+          hidden
+        >
+          <div class="admin-log-actions">
+            <label
+              >Search logs<input
+                id="log-search"
+                type="search"
+                placeholder="Room, event or error" /></label
+            ><label class="checkbox-label"
+              ><input id="live-logs" type="checkbox" checked /> Live
+              updates</label
+            ><button id="refresh-logs">Refresh</button
+            ><button id="download-logs">Download logs</button>
+          </div>
+          <p class="hint">
+            Latest 500 bridge events since its last restart, including RetroArch
+            connections and save errors. Game data and connection secrets are
+            excluded.
+          </p>
+          <p id="logs-message" role="status"></p>
+          <ol
+            id="log-entries"
+            class="admin-records admin-logs"
+            aria-label="Bridge events"
+          ></ol>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="admin.js"></script>
+  </body>
+</html>
