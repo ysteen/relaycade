@@ -1,4 +1,4 @@
-# RetroArch Netplay Bridge
+# Relaycade
 
 A self-hosted input relay for browser cores and unmodified RetroArch clients. Each participant runs the emulation locally. A RetroArch or browser host supplies the initial state; late inputs are corrected by bounded rollback. The service relays input and snapshots without running emulator sessions or streaming video. Its optional durable save queue lets RomM synchronize each original participant's cartridge save, including in native-only rooms.
 
@@ -14,7 +14,7 @@ The first two cores require matching native/WASM patches. Snes9x uses the pinned
 
 - [Install RomM and bridge on another server](https://github.com/ysteen/romm/blob/custom/netplay-retroarch-bridge/docs/NETPLAY_INSTALL.md): portable images, runtime assets, HTTPS, verification, updates and backups.
 - [Player guide](https://github.com/ysteen/romm/blob/custom/netplay-retroarch-bridge/docs/ROLLBACK_ROOMS.md): rooms, automatic Windows core setup, saves and rejoin.
-- [Administration](docs/administration.md): bridge-owned dashboard, RomM administrator authentication and the adapter contract.
+- [Administration](docs/administration.md): Relaycade administrator login, RomM adapter setup and the dashboard.
 - [Core builds](docs/native-builds.md), [room lifecycle](docs/room-lifecycle.md), [save synchronization](docs/save-sync.md) and [protocol](PROTOCOL.md): maintainer references.
 
 The portable installation bundle is exported from a tested deployment and includes its exact images and code overlays. It does not depend on development paths or a running development server. A published image can lag uncommitted local work; do not assume a source checkout or a mutable image tag includes that work.
@@ -62,7 +62,7 @@ connection commands, see the [RomM connection guide](https://github.com/ysteen/r
 ```mermaid
 flowchart LR
     Web[Browser and WASM core] -->|Login, games, saves| RomM[RomM backend]
-    RomM -->|Room API and service token| Bridge[Netplay Bridge]
+    RomM -->|Room API and service token| Bridge[Relaycade]
     Web <-->|Inputs and state over WebSocket| Bridge
     Native[RetroArch and native core] <-->|RetroArch TCP protocol| Bridge
 ```

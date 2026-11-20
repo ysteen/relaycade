@@ -131,7 +131,7 @@ RomM's backend uses `NETPLAY_BRIDGE_URL` for the internal HTTP endpoint, `NETPLA
 
 ## Verification
 
-[Netplay Bridge CI](../.github/workflows/verify.yml) runs transport/session
+[Relaycade CI](../.github/workflows/verify.yml) runs transport/session
 tests, builds the dedicated Docker image and checks container startup on pull
 requests or manual dispatch. It does not publish an image. Emulator qualification
 requires separately built core artifacts and is not replaced by this CI job.

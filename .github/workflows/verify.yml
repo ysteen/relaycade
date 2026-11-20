@@ -1,4 +1,4 @@
-name: Netplay Bridge
+name: Relaycade
 
 on:
   pull_request:

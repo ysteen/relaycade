@@ -4,19 +4,20 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
-    <title>Netplay Bridge administration</title>
+    <title>Relaycade administration</title>
     <link rel="stylesheet" href="admin.css" />
   </head>
   <body>
     <main class="admin-panel">
       <header class="admin-heading">
         <div>
-          <h1>Multiplayer administration</h1>
+          <h1>Relaycade administration</h1>
           <p class="hint">Server settings, saves and connection logs</p>
         </div>
         <div class="form-actions">
           <a id="application-link" href="/" target="_blank" rel="noopener"
             >Open application</a
+          ><button id="local-logout" type="button" hidden>Sign out</button
           ><label
             >Theme<select id="theme">
               <option value="">System</option>
@@ -29,7 +30,29 @@
       <section id="access" aria-labelledby="access-title">
         <h2 id="access-title">Checking administrator access…</h2>
         <p id="access-message" role="status">Using your application login.</p>
-        <div class="form-actions">
+        <form id="local-login" hidden>
+          <label
+            >Username<input
+              id="local-username"
+              name="username"
+              autocomplete="username"
+              maxlength="64"
+              required
+          /></label>
+          <label
+            >Password<input
+              id="local-password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              maxlength="256"
+              required
+          /></label>
+          <button id="local-signin" type="submit" class="primary">
+            Sign in
+          </button>
+        </form>
+        <div id="adapter-login" class="form-actions">
           <a id="signin-link" href="/" target="_blank" rel="noopener"
             >Sign in to application</a
           ><button id="check-access">Check access</button>
@@ -110,6 +133,34 @@
                     Use deployment settings
                   </button>
                 </div>
+              </fieldset>
+            </form>
+            <form id="romm-form" hidden>
+              <fieldset>
+                <legend>RomM integration</legend>
+                <label
+                  >RomM site URL<input
+                    id="romm-site"
+                    type="url"
+                    placeholder="https://romm.example.com"
+                    maxlength="2048"
+                /></label>
+                <label
+                  >Shared service token<input
+                    id="romm-token"
+                    type="password"
+                    maxlength="256"
+                    autocomplete="new-password"
+                /></label>
+                <p class="hint">
+                  Use the same service token in RomM. Leave the token blank to
+                  keep its current value.
+                </p>
+                <p id="romm-token-state" class="hint"></p>
+                <p id="romm-activity" class="hint" role="status"></p>
+                <button id="save-romm" class="primary" type="submit">
+                  Save RomM connection
+                </button>
               </fieldset>
             </form>
             <form id="runtime-form">

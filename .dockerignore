@@ -6,6 +6,7 @@
 !native-launch.mjs
 !wire.mjs
 !admin.mjs
+!management.mjs
 !resources.mjs
 !save-extract.mjs
 !save-outbox.mjs

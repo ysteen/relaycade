@@ -70,10 +70,21 @@ export class BridgeAdmin {
 
   update(value) {
     const settings = this.validate(value);
+    return this.persist(
+      "settings.json",
+      () => settings,
+      (value) => {
+        this.settings = value;
+      },
+    );
+  }
+
+  persist(name, value, onSaved) {
     if (!this.directory)
       throw new Error("Persistent bridge storage is not configured");
     const action = this.pending.then(async () => {
-      const path = join(this.directory, "settings.json");
+      const settings = value();
+      const path = join(this.directory, name);
       const file = await open(path + ".tmp", "w", 0o600);
       try {
         await file.writeFile(JSON.stringify(settings));
@@ -88,7 +99,7 @@ export class BridgeAdmin {
       } finally {
         await directory.close();
       }
-      this.settings = settings;
+      onSaved(settings);
       return settings;
     });
     this.pending = action.catch(() => {});
