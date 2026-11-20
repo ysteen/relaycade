@@ -1,0 +1,11 @@
+# Import this site next to the RomM and transport sites.
+https://{$BRIDGE_ADMIN_HOST} {
+    redir / /admin/ 302
+    @admin path /admin /admin/*
+    handle @admin {
+        reverse_proxy {$BRIDGE_UPSTREAM}
+    }
+    handle {
+        respond 404
+    }
+}

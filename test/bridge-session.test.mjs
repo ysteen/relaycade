@@ -195,6 +195,48 @@ test("web uses a native host snapshot and catches up with at most one muted fram
   link.stop();
 });
 
+test("web limits future inputs while the RetroArch host stops reporting frames", () => {
+  const socket = new Socket();
+  const link = new BridgeConnection(new Core(), socket, {
+    player: 1,
+    players: 2,
+    maxPrediction: 12,
+  });
+  const receive = (packet) =>
+    link.receive(JSON.stringify({ generation: link.generation, ...packet }));
+  receive({ t: "joined", player: 1, players: 2, nativeAuthority: true });
+  receive({ t: "start", f: 0, player: 1, players: 2, maxPrediction: 12 });
+  const reportHostFrame = (f) => {
+    if (f % 6 === 0) receive({ t: "clock", host: 0, f });
+    receive({ t: "input", player: 0, f, b: 0 });
+  };
+  for (let f = 0; f < 60; f++) {
+    reportHostFrame(f);
+    assert.equal(link.tick(0), true);
+  }
+
+  for (let i = 0; i < 600; i++) link.tick(0);
+  assert.equal(link.session.frame, 62);
+  assert.equal(link.session.nextInput - 1, 63);
+
+  const sent = socket.sent.length;
+  for (let i = 0; i < 10; i++) assert.equal(link.tick(16), false);
+  assert.equal(socket.sent.length, sent);
+
+  for (let f = 60; f < 120; f++) {
+    reportHostFrame(f);
+    assert.equal(link.tick(16), true);
+    assert.equal(link.session.frame, f + 3);
+  }
+  const inputs = socket.sent
+    .filter((packet) => typeof packet === "string")
+    .map((packet) => JSON.parse(packet))
+    .filter((packet) => packet.t === "input");
+  assert.deepEqual(inputs.map(({ f }) => f), inputs.map((_, f) => f));
+  assert.deepEqual(inputs[64], { t: "input", f: 64, b: 16 });
+  link.stop();
+});
+
 test("pause messages during restart preparation do not disconnect the web player", () => {
   const core = new Core();
   core.profile = { memoryIds: [0, 1] };

@@ -1,4 +1,4 @@
-# RetroArch Netplay Bridge
+# Relaycade
 
 A self-hosted input relay for browser cores and unmodified RetroArch clients. Each participant runs the emulation locally. A RetroArch or browser host supplies the initial state; late inputs are corrected by bounded rollback. The service relays input and snapshots without running emulator sessions or streaming video. Its optional durable save queue lets RomM synchronize each original participant's cartridge save, including in native-only rooms.
 
@@ -14,7 +14,7 @@ The first two cores require matching native/WASM patches. Snes9x uses the pinned
 
 - [Install RomM and bridge on another server](https://github.com/ysteen/romm/blob/custom/netplay-retroarch-bridge/docs/NETPLAY_INSTALL.md): portable images, runtime assets, HTTPS, verification, updates and backups.
 - [Player guide](https://github.com/ysteen/romm/blob/custom/netplay-retroarch-bridge/docs/ROLLBACK_ROOMS.md): rooms, automatic Windows core setup, saves and rejoin.
-- [Administration](docs/administration.md): bridge-owned dashboard, RomM administrator authentication and the adapter contract.
+- [Administration](docs/administration.md): Relaycade administrator login, RomM adapter setup and the dashboard.
 - [Core builds](docs/native-builds.md), [room lifecycle](docs/room-lifecycle.md), [save synchronization](docs/save-sync.md) and [protocol](PROTOCOL.md): maintainer references.
 - [Nintendo DS WFC](docs/ds-wfc.md): melonDS DS web port, authenticated network gateway, console identity and qualification limits.
 
@@ -63,7 +63,7 @@ connection commands, see the [RomM connection guide](https://github.com/ysteen/r
 ```mermaid
 flowchart LR
     Web[Browser and WASM core] -->|Login, games, saves| RomM[RomM backend]
-    RomM -->|Room API and service token| Bridge[Netplay Bridge]
+    RomM -->|Room API and service token| Bridge[Relaycade]
     Web <-->|Inputs and state over WebSocket| Bridge
     Native[RetroArch and native core] <-->|RetroArch TCP protocol| Bridge
 ```
@@ -72,7 +72,7 @@ RomM owns account authentication, game access, room permissions, and save upload
 
 The Compose configuration persists pending saves in the `netplay-saves` volume. RomM consumes that queue using its scheduled task and writes a separate room save for each original account and cartridge. Keep the volume when updating containers. See [server save synchronization](docs/save-sync.md) for formats, retries and verification limits.
 
-RomM rooms use a waiting room with an explicit host start. Everyone initially has no player number. Guests can select their own number; the host can assign anyone's number, including native guests. Numbers must be unique and every slot must be connected and assigned before starting. Leaving the creation password blank creates a passwordless room; web guests still sign in to RomM.
+The room creator starts the game and manages the waiting room while they remain a member. A playing RetroArch can supply the game state and clock independently. Everyone initially has no player number. Guests can select their own number; the host can assign anyone's number, including native guests. Numbers must be unique and every slot must be connected and assigned before starting. Leaving the creation password blank creates a passwordless room; web guests still sign in to RomM.
 
 Configure the RomM backend with:
 
@@ -92,7 +92,7 @@ node scripts/sync-romm-client.mjs ../romm-retroarch-sync
 node scripts/sync-romm-client.mjs ../romm-retroarch-sync --check
 ```
 
-See [PROTOCOL.md](PROTOCOL.md) for the backend and WebSocket contracts. RomM rooms keep playing when someone leaves, prefer a playing RetroArch as host, then a playing browser, and admit compatible returning participants from live state. The room panel shows each participant's round-trip latency to the relay beside their name. Account-bound rooms use personal native credentials issued through the Windows launcher; invitation passwords are separate.
+See [PROTOCOL.md](PROTOCOL.md) for the backend and WebSocket contracts. RomM rooms keep playing when someone leaves, prefer a playing RetroArch for state and clock authority, then a playing browser, and admit compatible returning participants from live state. The room panel shows each participant's round-trip latency to the relay beside their name. Account-bound rooms use personal native credentials issued through the Windows launcher; invitation passwords are separate.
 
 ## Verify and build cores
 

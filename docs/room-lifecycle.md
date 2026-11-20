@@ -1,5 +1,10 @@
 # Room membership, game lifetime and cable ownership
 
+The room creator controls game start, seat assignment, player removal and the
+disconnect policy. Switching between browser and RetroArch keeps these rights.
+If the creator leaves the room, a remaining member takes over. Game state and
+clock authority use a separate election that prioritizes a playing RetroArch.
+
 ## Disconnect behavior
 
 The host chooses **Keep playing** or **Pause until players rejoin** when creating a room and can change it from the waiting room. New browser-created rooms default to pause; API callers that omit `disconnectPolicy` retain continue behavior. Only a playing participant leaving, disconnecting or closing their game triggers the policy. Idle room members do not pause a game.

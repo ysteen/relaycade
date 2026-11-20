@@ -1,6 +1,5 @@
 const korean = {
-  "Netplay Bridge administration": "넷플레이 브리지 관리",
-  "Multiplayer administration": "멀티플레이 관리",
+  "Relaycade administration": "Relaycade 관리",
   "Server settings, saves and connection logs":
     "서버 설정, 세이브 및 연결 로그",
   "Open application": "RomM 열기",
@@ -118,6 +117,29 @@ const korean = {
   "{count} saves are still pending. Check the queue for details.":
     "세이브 {count}개가 대기 중입니다. 자세한 내용은 대기열을 확인하세요.",
   "Request failed ({code})": "요청 실패({code})",
+  Username: "사용자 이름",
+  Password: "비밀번호",
+  "Sign in": "로그인",
+  "Sign out": "로그아웃",
+  "Sign in to the bridge": "브리지에 로그인하세요",
+  "Use your bridge administrator account.": "브리지 관리자 계정을 사용하세요.",
+  "Invalid administrator username or password":
+    "관리자 이름 또는 비밀번호가 올바르지 않습니다.",
+  "Too many login attempts. Try again in a minute.":
+    "로그인 시도가 너무 많습니다. 1분 뒤 다시 시도하세요.",
+  "RomM integration": "RomM 연동",
+  "RomM site URL": "RomM 사이트 주소",
+  "Shared service token": "서버 간 공유 토큰",
+  "Use the same service token in RomM. Leave the token blank to keep its current value.":
+    "RomM에도 같은 토큰을 설정하세요. 비워 두면 기존 토큰을 유지합니다.",
+  "A shared token is configured.": "공유 토큰이 설정돼 있습니다.",
+  "No shared token configured.": "공유 토큰이 설정되지 않았습니다.",
+  "No authenticated adapter requests since the bridge started or the connection changed.":
+    "브리지 시작 또는 연결 설정 변경 이후 인증된 연동 요청이 없습니다.",
+  "Last authenticated adapter request: {time}":
+    "마지막 인증된 연동 요청: {time}",
+  "Save RomM connection": "RomM 연결 저장",
+  "RomM connection saved.": "RomM 연결을 저장했습니다.",
 };
 
 let language;
@@ -155,6 +177,13 @@ function installLanguage(locale) {
 
 const $ = (id) => document.getElementById(id);
 const base = new URL("../", import.meta.url).href.replace(/\/$/, "");
+const standalone = new URL(base).pathname === "/admin/api";
+$("local-login").hidden = !standalone;
+$("adapter-login").hidden = standalone;
+$("network-form").hidden = standalone;
+$("romm-form").hidden = !standalone;
+$("sync-saves").hidden = standalone;
+if (standalone) $("application-link").hidden = true;
 let context = { application_name: "application", application_url: "/" };
 let timer,
   logs = [],
@@ -173,6 +202,17 @@ function denied(code) {
   renderResources(null);
   $("dashboard").hidden = true;
   $("access").hidden = false;
+  $("local-logout").hidden = true;
+  if (standalone) {
+    $("application-link").hidden = true;
+    $("local-password").value = "";
+    $("romm-form").reset();
+    $("access-title").textContent = t("Sign in to the bridge");
+    $("access-message").textContent = t(
+      "Use your bridge administrator account.",
+    );
+    return;
+  }
   $("access-title").textContent =
     code === 401
       ? t("Sign in as a {app} administrator", { app: context.application_name })
@@ -199,19 +239,16 @@ async function api(path = "", options = {}) {
     .split(";")
     .map((item) => item.trim())
     .find((item) => item.startsWith(`${context.csrf_cookie}=`));
+  const csrf =
+    context.csrf_token ||
+    (cookie ? decodeURIComponent(cookie.slice(cookie.indexOf("=") + 1)) : "");
   const response = await fetch(base + path, {
     ...options,
     credentials: "same-origin",
     cache: "no-store",
     headers: {
       "Content-Type": "application/json",
-      ...(context.csrf_header && cookie
-        ? {
-            [context.csrf_header]: decodeURIComponent(
-              cookie.slice(cookie.indexOf("=") + 1),
-            ),
-          }
-        : {}),
+      ...(context.csrf_header && csrf ? { [context.csrf_header]: csrf } : {}),
     },
   });
   if (response.status === 401 || response.status === 403) {
@@ -222,7 +259,7 @@ async function api(path = "", options = {}) {
   if (!response.ok) {
     const error = new Error(
       typeof value?.detail === "string"
-        ? value.detail
+        ? t(value.detail)
         : t("Request failed ({code})", { code: response.status }),
     );
     error.status = response.status;
@@ -352,12 +389,34 @@ async function load(initialize = false) {
       return [dt, dd];
     }),
   );
+  if (standalone) {
+    $("local-logout").hidden = false;
+    const { site, tokenConfigured, lastRequestAt } = value.integration;
+    $("application-link").hidden = !site;
+    if (site) $("application-link").href = site;
+    if (initialize) $("romm-site").value = site;
+    $("save-romm").disabled = !broker.persistent;
+    $("romm-token-state").textContent = t(
+      tokenConfigured
+        ? "A shared token is configured."
+        : "No shared token configured.",
+    );
+    $("romm-activity").textContent = lastRequestAt
+      ? t("Last authenticated adapter request: {time}", {
+          time: new Date(lastRequestAt).toLocaleString(language),
+        })
+      : t(
+          "No authenticated adapter requests since the bridge started or the connection changed.",
+        );
+  }
   if (initialize) {
-    $("public-url").value = value.network.public_url;
-    $("native-host").value = value.network.native_host;
-    $("public-url").placeholder = value.defaults.public_url;
-    $("native-host").placeholder =
-      value.defaults.native_host || t("Use public bridge hostname");
+    if (!standalone) {
+      $("public-url").value = value.network.public_url;
+      $("native-host").value = value.network.native_host;
+      $("public-url").placeholder = value.defaults.public_url;
+      $("native-host").placeholder =
+        value.defaults.native_host || t("Use public bridge hostname");
+    }
     $("rooms-enabled").checked = broker.settings.roomsEnabled;
     $("max-rooms").value = broker.settings.maxRooms;
     $("max-rooms").max = broker.capacity;
@@ -584,5 +643,47 @@ $("theme").onchange = () => {
   document.documentElement.style.colorScheme = $("theme").value || "light dark";
 };
 $("check-access").onclick = checkAccess;
+$("local-login").onsubmit = async (event) => {
+  event.preventDefault();
+  $("local-signin").disabled = true;
+  const password = $("local-password").value;
+  $("local-password").value = "";
+  try {
+    await api("/login", {
+      method: "POST",
+      body: JSON.stringify({ username: $("local-username").value, password }),
+    });
+    await checkAccess();
+  } catch (error) {
+    $("access-message").textContent = error.message;
+  } finally {
+    $("local-signin").disabled = false;
+  }
+};
+$("local-logout").onclick = async () => {
+  try {
+    await api("/logout", { method: "POST" });
+    context = { application_name: "RomM", application_url: "" };
+    denied(401);
+  } catch (error) {
+    status(error.message, true);
+  }
+};
+$("romm-form").onsubmit = (event) => {
+  event.preventDefault();
+  const token = $("romm-token").value;
+  $("romm-token").value = "";
+  void action(
+    $("save-romm"),
+    async () => {
+      const integration = await api("/integration", {
+        method: "PUT",
+        body: JSON.stringify({ site: $("romm-site").value.trim(), token }),
+      });
+      $("romm-site").value = integration.site;
+    },
+    "RomM connection saved.",
+  );
+};
 window.addEventListener("pagehide", () => clearInterval(timer));
 void checkAccess();

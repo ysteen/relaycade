@@ -34,7 +34,7 @@ try {
         $code = Join-Path $work 'repo'
         $runtime = Join-Path $work 'runtime'
         New-Item -ItemType Directory -Force $code, $runtime, (Join-Path $code 'client'), (Join-Path $code 'test'), (Join-Path $code 'node_modules') | Out-Null
-        foreach ($name in @('server.mjs','native.mjs','native-launch.mjs','wire.mjs','admin.mjs','resources.mjs','save-extract.mjs','save-outbox.mjs','package.json')) {
+        foreach ($name in @('server.mjs','native.mjs','native-launch.mjs','wire.mjs','admin.mjs','management.mjs','resources.mjs','save-extract.mjs','save-outbox.mjs','package.json')) {
             Copy-Item (Join-Path $repo $name) $code
         }
         Copy-Item (Join-Path $repo 'client\*.js') (Join-Path $code 'client')

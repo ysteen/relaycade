@@ -108,3 +108,40 @@ initial rate sample is not shown as zero usage.
 
 No Docker socket, privileged access, new port or extra agent is needed. These
 metrics use the same administrator-only overview endpoint as the settings.
+
+## Standalone administrator login
+
+Standalone administration is optional. It uses the bridge's own administrator
+account and is available even when RomM is offline. The existing RomM admin
+adapter and the player lobby keep their existing behavior.
+
+Set these values for the bridge service:
+
+```dotenv
+NETPLAY_BRIDGE_LOCAL_ADMIN_USERNAME=admin
+NETPLAY_BRIDGE_LOCAL_ADMIN_PASSWORD=<random password of at least 16 characters>
+NETPLAY_BRIDGE_LOCAL_ADMIN_ORIGIN=https://bridge-admin.example.com
+```
+
+Use a long generated password and keep it in the deployment environment.
+Use a different value for `NETPLAY_BRIDGE_ADMIN_TOKEN`, the service credential.
+The bridge checks the exact HTTPS origin for browser writes. Keep its upstream
+HTTP port private and proxy only `/admin` and `/admin/*` on the admin hostname.
+See [the standalone Caddy example](../deploy/caddy/standalone-admin.Caddyfile.example).
+The dashboard is at `/admin/`. The browser session uses a secure HttpOnly cookie,
+expires after eight hours, and ends when the bridge restarts.
+
+Under **RomM integration**, set the RomM site URL and a shared service token.
+The site URL provides a navigation link. The bridge does not fetch it. Set the
+same token in RomM's `NETPLAY_BRIDGE_TOKEN` and point `NETPLAY_BRIDGE_URL` to the
+bridge's internal HTTP address. Maintain the RomM browser origin in
+`NETPLAY_BRIDGE_ORIGINS` on the bridge. Public WebSocket and native connection
+addresses remain in the RomM adapter settings. The dashboard shows the time of
+the most recent authenticated adapter request as a connectivity signal.
+
+Only one RomM integration is supported. A blank token leaves the current one in
+place. If the administrator replaces it, the stored token hash takes precedence
+over the service environment variable and RomM must be updated to match. The
+dashboard never returns the token. Back up the bridge data volume, including
+`romm-integration.json`, to retain the settings. Without a RomM integration token,
+the administrator can still open the dashboard and manage the bridge.

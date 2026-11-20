@@ -16,6 +16,7 @@ import { CMD, MAX_STATE, fixedString } from "./wire.mjs";
 import { extractSaves, supportsSaves } from "./save-extract.mjs";
 import { SaveOutbox } from "./save-outbox.mjs";
 import { BridgeAdmin, adminAsset } from "./admin.mjs";
+import { BridgeManagement } from "./management.mjs";
 import { cableInputProfile, CABLE_INPUT } from "./client/link-core.js";
 
 const MAX_JSON = 512 * 1024;
@@ -218,6 +219,7 @@ class Room {
     this.latestCheckpoint = 0;
     this.resyncs = [];
     this.host = 0;
+    this.roomHost = 0;
     this.generation = 0;
     this.vacant = new Map();
     this.detached = new Set();
@@ -298,6 +300,7 @@ class Room {
             : null,
         ) ?? null,
       host: this.host,
+      roomHost: this.roomHost,
       saveHost: this.saveHost(),
       saves: this.saveStatus(),
       canStart: this.canStart(),
@@ -464,7 +467,7 @@ class Room {
   assignSeat(peer, player, seat) {
     if (!this.manifest.manualStart || this.starting || this.loadingContent)
       return "The room is not accepting player changes";
-    if (peer.player !== this.host && player !== peer.player)
+    if (peer.player !== this.roomHost && player !== peer.player)
       return "You can only change your own player number";
     const target = this.peers.get(player) ?? this.reservations.get(player);
     if (
@@ -798,6 +801,7 @@ class Room {
       players: this.manifest.players,
       seats: this.seats,
       host: this.host,
+      roomHost: this.roomHost,
       saveHost: this.saveHost(),
       saves: this.saveStatus(),
       running: !!this.running,
@@ -824,7 +828,7 @@ class Room {
     if (data.t === "disconnect-policy") {
       if (this.starting || this.loadingContent)
         return reject("The game is already starting");
-      if (peer.player !== this.host)
+      if (peer.player !== this.roomHost)
         return reject("Only the host can change the disconnect policy");
       if (!["continue", "pause"].includes(data.disconnectPolicy))
         return reject("Invalid disconnect policy");
@@ -849,7 +853,7 @@ class Room {
       return;
     }
     if (data.t === "kick") {
-      if (peer.player !== this.host)
+      if (peer.player !== this.roomHost)
         return reject("Only the host can remove a player");
       if (!Number.isInteger(data.player) || data.player === peer.player)
         return reject("Choose another player to remove");
@@ -868,6 +872,7 @@ class Room {
         this.depart(target, message);
         target.ws.close(4003, message);
       } else if (this.peers.has(data.player)) target.drop(message);
+      else this.electHost();
       this.lobby();
       return;
     }
@@ -878,7 +883,7 @@ class Room {
       if (error) return reject(error);
       return;
     }
-    if (peer.player !== this.host)
+    if (peer.player !== this.roomHost)
       return reject("Only the host can start the game");
     if (!this.canStart())
       return reject(
@@ -1090,7 +1095,10 @@ class Room {
     }
     if (!this.peers.size && !this.reservations.size)
       this.close("The last player left");
-    else this.lobby();
+    else {
+      this.electHost();
+      this.lobby();
+    }
   }
 
   resumeGame(peer) {
@@ -2217,7 +2225,8 @@ class Room {
           if (paused) {
             peer.probe.suspended = true;
             delete peer.probe.resumedAt;
-          } else if (peer.probe.suspended) peer.probe.resumedAt = performance.now();
+          } else if (peer.probe.suspended)
+            peer.probe.resumedAt = performance.now();
         }
         if (this.disconnectPause) {
           peer.setRoomPaused(paused);
@@ -2329,6 +2338,15 @@ class Room {
   }
 
   electHost() {
+    const memberships = new Map([
+      ...this.peers,
+      ...this.reservations,
+      ...this.controllers,
+    ]);
+    if (!memberships.has(this.roomHost))
+      this.roomHost = memberships.keys().next().value ?? null;
+    this.manifest.owner = memberships.get(this.roomHost)?.owner ?? "";
+
     if (this.manifest.nativeAuthority) {
       const members = [
         ...this.peers.values(),
@@ -2353,7 +2371,6 @@ class Room {
           kind: next?.kind ?? null,
         });
       this.host = next?.player ?? null;
-      this.manifest.owner = next?.owner ?? "";
       if (next?.playing) {
         this.progress =
           next.kind === "native"
@@ -2376,7 +2393,6 @@ class Room {
     const web = [...this.peers.values()].filter((peer) => peer.kind === "web");
     const next = web.find((peer) => peer.playing) ?? web[0];
     this.host = next?.player ?? null;
-    this.manifest.owner = next?.owner ?? "";
     if (next?.playing) {
       this.progress = next.frame;
       this.confirmed = next.confirmed;
@@ -2653,6 +2669,7 @@ class Room {
 
 export async function createBridge({
   adminToken,
+  localAdmin,
   host = "127.0.0.1",
   port = 0,
   nativeHost = "127.0.0.1",
@@ -2664,10 +2681,12 @@ export async function createBridge({
   wfcHelper = null,
   logger = (entry) => console.info(JSON.stringify(entry)),
 } = {}) {
-  if (typeof adminToken !== "string" || adminToken.length < 24)
-    throw new Error("Bridge admin token must contain at least 24 characters");
   const rooms = new Map();
   const admin = await new BridgeAdmin(saveDirectory, maxRooms).init();
+  const management = await new BridgeManagement(admin, {
+    adminToken,
+    ...localAdmin,
+  }).init();
   const bridge = {
     rooms,
     admin,
@@ -2688,15 +2707,31 @@ export async function createBridge({
     maxPayload: MAX_STATE,
     perMessageDeflate: false,
   });
-  async function body(request) {
+  async function body(request, limit = MAX_JSON) {
     let total = 0;
     const parts = [];
     for await (const chunk of request) {
       total += chunk.length;
-      if (total > MAX_JSON) throw new Error("Request body is too large");
+      if (total > limit) throw new Error("Request body is too large");
       parts.push(chunk);
     }
-    return JSON.parse(Buffer.concat(parts).toString() || "{}");
+    try {
+      return JSON.parse(Buffer.concat(parts).toString() || "{}");
+    } catch {
+      throw new Error("Invalid JSON request");
+    }
+  }
+  const overview = () =>
+    admin.status(bridge, {
+      httpPort: http.address().port,
+      nativePortStart: portStart,
+      nativePortEnd: portEnd,
+      allowedOrigins,
+    });
+  async function updateSettings(value) {
+    const settings = await admin.update(value);
+    bridge.log("admin-settings-updated", settings);
+    return settings;
   }
   const http = createHttpServer(async (request, response) => {
     const reply = (status, value) => {
@@ -2707,10 +2742,18 @@ export async function createBridge({
       response.end(JSON.stringify(value));
     };
     try {
-      const path = new URL(request.url, "http://bridge").pathname;
+      const url = new URL(request.url, "http://bridge");
+      const path = url.pathname;
+      if (path === "/admin" || path.startsWith("/admin/"))
+        return await management.handle(request, response, url, {
+          reply,
+          body,
+          overview,
+          updateSettings,
+        });
       if (path === "/health" && request.method === "GET")
         return reply(200, { status: "ok", rooms: rooms.size });
-      if (!secretEqual(request.headers.authorization, `Bearer ${adminToken}`))
+      if (!management.authorizeService(request.headers.authorization))
         return reply(401, { error: "Unauthorized" });
       if (path === "/v1/rooms/wfc/sessions" && request.method === "POST") {
         const result = await wfc.create((await body(request)).owner);
@@ -2729,15 +2772,7 @@ export async function createBridge({
         return response.end(asset.body);
       }
       if (path === "/v1/rooms/admin" && request.method === "GET")
-        return reply(
-          200,
-          admin.status(bridge, {
-            httpPort: http.address().port,
-            nativePortStart: portStart,
-            nativePortEnd: portEnd,
-            allowedOrigins,
-          }),
-        );
+        return reply(200, overview());
       if (path === "/v1/rooms/admin/logs" && request.method === "GET") {
         const after = Number(
           new URL(request.url, "http://bridge").searchParams.get("after") ?? 0,
@@ -2747,9 +2782,7 @@ export async function createBridge({
         return reply(200, admin.logs(after));
       }
       if (path === "/v1/rooms/admin/settings" && request.method === "PUT") {
-        const settings = await admin.update(await body(request));
-        bridge.log("admin-settings-updated", settings);
-        return reply(200, settings);
+        return reply(200, await updateSettings(await body(request)));
       }
       if (path === "/v1/rooms/save-queue" && request.method === "GET")
         return reply(
@@ -3204,6 +3237,11 @@ if (
 ) {
   const service = await createBridge({
     adminToken: process.env.NETPLAY_BRIDGE_ADMIN_TOKEN,
+    localAdmin: {
+      username: process.env.NETPLAY_BRIDGE_LOCAL_ADMIN_USERNAME,
+      password: process.env.NETPLAY_BRIDGE_LOCAL_ADMIN_PASSWORD,
+      publicOrigin: process.env.NETPLAY_BRIDGE_LOCAL_ADMIN_ORIGIN,
+    },
     host: process.env.NETPLAY_BRIDGE_BIND ?? "0.0.0.0",
     port: Number(process.env.NETPLAY_BRIDGE_HTTP_PORT ?? 8080),
     nativeHost: process.env.NETPLAY_BRIDGE_BIND ?? "0.0.0.0",

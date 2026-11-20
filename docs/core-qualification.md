@@ -100,7 +100,7 @@ The stock Snes9x live native run passed 662 executed web / 719 native frames, te
 
 The independent repository passed all 49 transport/client tests and its first
 GitHub Actions run, including Docker build and startup:
-[run 41223256063](https://github.com/ysteen/retroarch-netplay-bridge/actions/runs/41223256063).
+[run 41223256063](https://github.com/ysteen/relaycade/actions/runs/41223256063).
 The RomM SNES API passed 51 targeted account/permission tests. The installed
 browser room UI passed SameBoy, mGBA, and Snes9x at 603 confirmed frames per peer
 over real WebSockets, including delayed inputs, account save uploads, keyboard,

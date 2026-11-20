@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'ysteen/retroarch-netplay-bridge' && github.event.repository.private && github.ref == 'refs/heads/feature/ds-wfc'
+    if: github.repository == 'ysteen/relaycade' && github.event.repository.private && github.ref == 'refs/heads/feature/ds-wfc'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -65,7 +65,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: ${{ env.ROMM_NETPLAY_IMAGE }}
-          labels: org.opencontainers.image.source=https://github.com/ysteen/retroarch-netplay-bridge
+          labels: org.opencontainers.image.source=https://github.com/ysteen/relaycade
           build-args: ROMM_CUSTOM_REVISION=${{ env.ROMM_REVISION }}
           cache-from: type=gha,scope=netplay-romm-feature/ds-wfc
           cache-to: type=gha,mode=max,scope=netplay-romm-feature/ds-wfc
@@ -77,7 +77,7 @@ jobs:
           load: true
           tags: ${{ env.NETPLAY_BRIDGE_IMAGE }}
           labels: |
-            org.opencontainers.image.source=https://github.com/ysteen/retroarch-netplay-bridge
+            org.opencontainers.image.source=https://github.com/ysteen/relaycade
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=netplay-wfc-bridge
           cache-to: type=gha,mode=max,scope=netplay-wfc-bridge
@@ -94,6 +94,7 @@ jobs:
           docker run --rm --entrypoint sh "$NETPLAY_BRIDGE_IMAGE" -ec '
             test -x "$NETPLAY_WFC_HELPER"
             test -s /app/resources.mjs
+            test -s /app/management.mjs
             test -s /app/admin-ui/index.html
           '
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
