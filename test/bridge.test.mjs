@@ -556,7 +556,7 @@ test("native authority starts two RetroArch clients without a web core and trans
   assert.equal(stored.running, true);
 });
 
-test("cancelling or expiring the preferred native reservation restores the web host", async (t) => {
+test("removing a native reservation restores the web game host", async (t) => {
   const f = await fixture(t);
   const { data: room } = await f.api("/v1/rooms", {
     ...preparedManifest,
@@ -565,7 +565,7 @@ test("cancelling or expiring the preferred native reservation restores the web h
   });
   const stored = f.bridge.rooms.get(room.id);
   await f.web(room.hostPath);
-  for (const cancel of [true, false]) {
+  for (const removal of ["cancel", "expire", "leave", "kick"]) {
     const { data: reservation, status } = await f.api(
       `/v1/rooms/${room.id}/native`,
       {
@@ -577,23 +577,37 @@ test("cancelling or expiring the preferred native reservation restores the web h
     );
     assert.equal(status, 201, JSON.stringify(reservation));
     assert.equal(stored.host, 1);
-    if (cancel) {
+    assert.equal(stored.roomHost, 0);
+    if (removal === "cancel") {
       const response = await f.api(
         `/v1/rooms/${room.id}/native/${reservation.credential}`,
         undefined,
         "DELETE",
       );
       assert.equal(response.status, 200);
-    } else {
+    } else if (removal === "expire") {
       stored.reservations.get(1).until = Date.now() - 1;
       stored.expireReservations();
+    } else if (removal === "leave") {
+      const response = await f.api(`/v1/rooms/${room.id}/leave`, {
+        owner: "native",
+      });
+      assert.equal(response.status, 200);
+    } else {
+      const response = await f.api(`/v1/rooms/${room.id}/control`, {
+        owner: "host",
+        t: "kick",
+        player: 1,
+      });
+      assert.equal(response.status, 200);
     }
     assert.equal(stored.host, 0);
+    assert.equal(stored.roomHost, 0);
     assert.equal(stored.manifest.owner, "host");
   }
 });
 
-test("a native guest becomes the mixed room's initial state authority", async (t) => {
+test("the room creator starts the game with a native guest as state authority", async (t) => {
   const f = await fixture(t);
   const settings = {
     ...preparedManifest,
@@ -618,34 +632,42 @@ test("a native guest becomes the mixed room's initial state authority", async (t
   client.socket.write(packet(CMD.PLAY, words(0)));
   assert.equal((await client.queue.next()).command, CMD.INPUT);
   assert.equal(stored.host, 1);
+  assert.equal(stored.metadata().roomHost, 0);
+  assert.equal(stored.metadata().owner, "host");
   assert.equal(stored.state, null);
-  for (const player of [0, 1]) {
-    const result = await f.api(`/v1/rooms/${room.id}/control`, {
-      owner: "native",
-      t: "assign",
-      player,
-      seat: player,
-    });
-    assert.equal(result.status, 200);
-  }
+  const control = (owner, action) =>
+    f.api(`/v1/rooms/${room.id}/control`, { owner, ...action });
   assert.equal(
-    (
-      await f.api(`/v1/rooms/${room.id}/control`, {
-        owner: "host",
-        t: "start-request",
-      })
-    ).status,
+    (await control("native", { t: "assign", player: 0, seat: 1 })).status,
+    409,
+  );
+  assert.equal(
+    (await control("native", { t: "kick", player: 0 })).status,
     409,
   );
   assert.equal(
     (
-      await f.api(`/v1/rooms/${room.id}/control`, {
-        owner: "native",
-        t: "start-request",
+      await control("native", {
+        t: "disconnect-policy",
+        disconnectPolicy: "continue",
       })
     ).status,
-    200,
+    409,
   );
+  for (const player of [0, 1]) {
+    const result = await control("host", {
+      t: "assign",
+      player,
+      seat: 1 - player,
+    });
+    assert.equal(result.status, 200);
+  }
+  assert.deepEqual(stored.seats, [1, 0]);
+  assert.equal(
+    (await control("native", { t: "start-request" })).status,
+    409,
+  );
+  web.send({ t: "start-request", generation: stored.generation });
   assert.equal((await client.queue.next()).command, CMD.REQUEST_STATE);
   for (let n = 0; n < 2; n++)
     assert.equal((await client.queue.next()).command, CMD.INPUT);
@@ -682,7 +704,11 @@ test("a native guest becomes the mixed room's initial state authority", async (t
   while (start.t !== "start");
   assert.equal(stored.running, true);
   assert.equal(stored.host, 1);
+  assert.equal(stored.metadata().roomHost, 0);
   assert.equal(stored.saveHost(), 0);
+  await f.api(`/v1/rooms/${room.id}/leave`, { owner: "host" });
+  assert.equal(stored.metadata().roomHost, 1);
+  assert.equal(stored.metadata().owner, "native");
 });
 
 test("Windows handoff retains the account, member count and chosen seat", async (t) => {

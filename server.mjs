@@ -218,6 +218,7 @@ class Room {
     this.latestCheckpoint = 0;
     this.resyncs = [];
     this.host = 0;
+    this.roomHost = 0;
     this.generation = 0;
     this.vacant = new Map();
     this.detached = new Set();
@@ -298,6 +299,7 @@ class Room {
             : null,
         ) ?? null,
       host: this.host,
+      roomHost: this.roomHost,
       saveHost: this.saveHost(),
       saves: this.saveStatus(),
       canStart: this.canStart(),
@@ -464,7 +466,7 @@ class Room {
   assignSeat(peer, player, seat) {
     if (!this.manifest.manualStart || this.starting || this.loadingContent)
       return "The room is not accepting player changes";
-    if (peer.player !== this.host && player !== peer.player)
+    if (peer.player !== this.roomHost && player !== peer.player)
       return "You can only change your own player number";
     const target = this.peers.get(player) ?? this.reservations.get(player);
     if (
@@ -798,6 +800,7 @@ class Room {
       players: this.manifest.players,
       seats: this.seats,
       host: this.host,
+      roomHost: this.roomHost,
       saveHost: this.saveHost(),
       saves: this.saveStatus(),
       running: !!this.running,
@@ -824,7 +827,7 @@ class Room {
     if (data.t === "disconnect-policy") {
       if (this.starting || this.loadingContent)
         return reject("The game is already starting");
-      if (peer.player !== this.host)
+      if (peer.player !== this.roomHost)
         return reject("Only the host can change the disconnect policy");
       if (!["continue", "pause"].includes(data.disconnectPolicy))
         return reject("Invalid disconnect policy");
@@ -849,7 +852,7 @@ class Room {
       return;
     }
     if (data.t === "kick") {
-      if (peer.player !== this.host)
+      if (peer.player !== this.roomHost)
         return reject("Only the host can remove a player");
       if (!Number.isInteger(data.player) || data.player === peer.player)
         return reject("Choose another player to remove");
@@ -868,6 +871,7 @@ class Room {
         this.depart(target, message);
         target.ws.close(4003, message);
       } else if (this.peers.has(data.player)) target.drop(message);
+      else this.electHost();
       this.lobby();
       return;
     }
@@ -878,7 +882,7 @@ class Room {
       if (error) return reject(error);
       return;
     }
-    if (peer.player !== this.host)
+    if (peer.player !== this.roomHost)
       return reject("Only the host can start the game");
     if (!this.canStart())
       return reject(
@@ -1090,7 +1094,10 @@ class Room {
     }
     if (!this.peers.size && !this.reservations.size)
       this.close("The last player left");
-    else this.lobby();
+    else {
+      this.electHost();
+      this.lobby();
+    }
   }
 
   resumeGame(peer) {
@@ -2330,6 +2337,15 @@ class Room {
   }
 
   electHost() {
+    const memberships = new Map([
+      ...this.peers,
+      ...this.reservations,
+      ...this.controllers,
+    ]);
+    if (!memberships.has(this.roomHost))
+      this.roomHost = memberships.keys().next().value ?? null;
+    this.manifest.owner = memberships.get(this.roomHost)?.owner ?? "";
+
     if (this.manifest.nativeAuthority) {
       const members = [
         ...this.peers.values(),
@@ -2354,7 +2370,6 @@ class Room {
           kind: next?.kind ?? null,
         });
       this.host = next?.player ?? null;
-      this.manifest.owner = next?.owner ?? "";
       if (next?.playing) {
         this.progress =
           next.kind === "native"
@@ -2377,7 +2392,6 @@ class Room {
     const web = [...this.peers.values()].filter((peer) => peer.kind === "web");
     const next = web.find((peer) => peer.playing) ?? web[0];
     this.host = next?.player ?? null;
-    this.manifest.owner = next?.owner ?? "";
     if (next?.playing) {
       this.progress = next.frame;
       this.confirmed = next.confirmed;
