@@ -126,6 +126,9 @@ test("admin settings require the service token, survive restart and leave existi
   assert.equal(snapshot.rooms.length, 1);
   assert.deepEqual(snapshot.settings, settings);
   assert.equal(snapshot.persistent, true);
+  assert.equal(Object.hasOwn(snapshot.resources, "host"), false);
+  assert(snapshot.resources.service.usedBytes > 0);
+  assert(["container", "process"].includes(snapshot.resources.service.scope));
   const events = await (await call("/admin/logs")).json();
   assert(
     events.events.some((event) => event.event === "admin-settings-updated"),

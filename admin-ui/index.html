@@ -173,6 +173,37 @@
           aria-labelledby="logs-tab"
           hidden
         >
+          <section aria-labelledby="resources-title">
+            <h2 id="resources-title">Bridge resources</h2>
+            <p id="resource-updated" class="hint" role="status">
+              Collecting usage…
+            </p>
+            <div
+              class="admin-stats admin-resource-stats"
+              aria-label="Bridge resource usage"
+            >
+              <article>
+                <span id="service-cpu-label">Bridge CPU</span
+                ><strong id="service-cpu">—</strong>
+                <p id="service-cpu-detail" class="hint"></p>
+              </article>
+              <article>
+                <span id="service-memory-label">Bridge memory</span
+                ><strong id="service-memory">—</strong>
+                <p id="service-memory-detail" class="hint"></p>
+              </article>
+              <article>
+                <span>Bridge network</span
+                ><strong id="service-network">—</strong>
+                <p id="service-network-detail" class="hint"></p>
+              </article>
+            </div>
+            <p class="hint">
+              Container usage includes WFC gateways. Network totals are since
+              container start, excluding loopback traffic. Values update every
+              five seconds while this page is visible.
+            </p>
+          </section>
           <div class="admin-log-actions">
             <label
               >Search logs<input

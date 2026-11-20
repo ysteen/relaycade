@@ -263,3 +263,24 @@ body {
     padding: 12px;
   }
 }
+
+.admin-panel .admin-stats article {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.admin-panel .admin-stats article p {
+  margin-bottom: 0;
+}
+
+.admin-panel .admin-resource-stats {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.admin-panel #service-network {
+  white-space: pre-line;
+  font-size: 1.2rem;
+}
+@media (max-width: 800px) {
+  .admin-panel .admin-resource-stats {
+    grid-template-columns: 1fr;
+  }
+}

@@ -20,6 +20,24 @@ await mkdir(output, { recursive: true });
 let role = "anonymous",
   failure = false,
   updates = 0;
+let resources = {
+  sampledAt: "2026-11-08T00:00:00Z",
+  service: {
+    scope: "container",
+    cores: 1,
+    cpuPercent: 12.5,
+    usedBytes: 64 * 1024 ** 2,
+    limitBytes: 256 * 1024 ** 2,
+    memoryPercent: 25,
+    network: {
+      scope: "container",
+      rxBytes: 42 * 1024 ** 2,
+      txBytes: 10 * 1024 ** 2,
+      rxBytesPerSecond: 2048,
+      txBytesPerSecond: 4096,
+    },
+  },
+};
 const runtime = { roomsEnabled: true, maxRooms: 8, saveIntervalSeconds: 15 };
 let network = { public_url: "", native_host: "" },
   pending = 1;
@@ -112,6 +130,7 @@ const server = createServer(async (request, response) => {
         native_host: "example.test",
       },
       broker: {
+        resources,
         settings: runtime,
         capacity: 8,
         persistent: true,
@@ -251,23 +270,82 @@ try {
         "true",
       );
       assert.equal(await page.locator("#log-entries script").count(), 0);
+      assert.equal(
+        await page.locator(".admin-resource-stats article").count(),
+        3,
+      );
+      assert.equal(await page.locator("#host-cpu, #host-memory").count(), 0);
+      assert(
+        (await page.locator("#service-network").textContent()).includes(
+          "2.0 KiB/s",
+        ),
+      );
+      assert(
+        (await page.locator("#service-network").textContent()).includes(
+          "4.0 KiB/s",
+        ),
+      );
+      assert(
+        (await page.locator("#service-network-detail").textContent()).includes(
+          "42.0 MiB",
+        ),
+      );
+      assert.equal(await page.locator("#service-cpu").textContent(), "12.5%");
+      assert.equal(
+        await page.locator("#service-memory").textContent(),
+        "64.0 MiB",
+      );
+      for (const width of [320, 768, 3840]) {
+        await page.setViewportSize({ width, height: 950 });
+        assert(
+          await page.evaluate(
+            () => document.documentElement.scrollWidth <= innerWidth,
+          ),
+          `Resource overflow at ${width}`,
+        );
+      }
+      await page.setViewportSize({ width: 1200, height: 950 });
+
       await page.locator("#log-search").fill("native-connect");
       assert.equal(await page.locator("#log-entries li").count(), 1);
       await page.locator("#log-search").fill("no-such-event");
       assert.equal(await page.locator("#log-entries li").count(), 0);
       await page.locator("#log-search").fill("");
-      await page.screenshot({ path: resolve(output, `${theme}-logs.png`) });
+      await page.screenshot({
+        path: resolve(output, `${theme}-logs.png`),
+        fullPage: true,
+      });
       const downloaded = page.waitForEvent("download");
       await page.locator("#download-logs").click();
       assert.equal(
         (await downloaded).suggestedFilename(),
         "netplay-bridge-logs.jsonl",
       );
+      const previousResources = resources;
+      resources = {
+        ...resources,
+        service: { ...resources.service, network: null },
+      };
+      await page.locator("#refresh-logs").click();
+      await page
+        .locator("#service-network")
+        .filter({ hasText: "Unavailable" })
+        .waitFor();
+      assert.equal(await page.locator("#service-cpu").textContent(), "12.5%");
+      resources = undefined;
+      await page.locator("#refresh-logs").click();
+      await page
+        .locator("#resource-updated")
+        .filter({ hasText: "unavailable" })
+        .waitFor();
+      assert.equal(await page.locator("#service-network").textContent(), "—");
+      resources = previousResources;
       role = "user";
       await page.locator("#refresh-logs").click();
       await page.locator("#access").waitFor({ state: "visible" });
       assert(await page.locator("#dashboard").isHidden());
       assert.equal(await page.locator("#log-entries li").count(), 0);
+      assert.equal(await page.locator("#service-memory").textContent(), "—");
       assert.deepEqual(errors, []);
       await context.close();
     }

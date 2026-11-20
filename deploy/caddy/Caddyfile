@@ -1,0 +1,57 @@
+{
+    skip_install_trust
+    auto_https disable_redirects
+    servers :8083 {
+        listener_wrappers {
+            http_redirect
+            tls
+        }
+    }
+}
+https://{$ROMM_HOST}:8443 {
+    tls internal
+    handle_path /bridge/* {
+        reverse_proxy {$BRIDGE_UPSTREAM}
+    }
+    @adminDocument path /api/netplay/bridge/admin/ui /api/netplay/bridge/admin/ui/ /api/netplay/bridge/admin/ui/index.html
+    handle @adminDocument {
+        header Cache-Control no-store
+        redir https://{$ROMM_HOST}:8083/ 302
+    }
+    handle {
+        reverse_proxy {$ROMM_UPSTREAM}
+    }
+}
+https://{$ROMM_HOST}:8083 {
+    tls internal
+    @adminDocument path / /api/netplay/bridge/admin/ui /api/netplay/bridge/admin/ui/ /api/netplay/bridge/admin/ui/index.html
+    handle @adminDocument {
+        rewrite * /api/netplay/bridge/admin/ui/
+        reverse_proxy {$ROMM_UPSTREAM} {
+            @signin status 401 403
+            handle_response @signin {
+                rewrite * /index.html
+                root * "{$ADMIN_ENTRY_DIR}"
+                header Cache-Control no-store
+                file_server
+            }
+        }
+    }
+    redir /admin.js /api/netplay/bridge/admin/ui/admin.js 307
+    redir /admin.css /api/netplay/bridge/admin/ui/admin.css 307
+    @publicAdminAsset path /admin-access.js /romm-lan-root.crt
+    handle @publicAdminAsset {
+        root * "{$ADMIN_ENTRY_DIR}"
+        header Cache-Control no-store
+        file_server
+    }
+    @adminApi path /api/netplay/bridge/admin /api/netplay/bridge/admin/*
+    handle @adminApi {
+        reverse_proxy {$ROMM_UPSTREAM} {
+            header_down X-Netplay-Application-URL https://{$ROMM_HOST}:8443/
+        }
+    }
+    handle {
+        respond 404
+    }
+}

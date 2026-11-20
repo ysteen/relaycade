@@ -30,11 +30,11 @@ sequenceDiagram
 
 Sign in to RomM as an administrator, then open
 `https://romm.example.com/api/netplay/bridge/admin/ui/`. RomM's previous
-`/assets/emulatorjs/input-netplay/admin.html` URL redirects here. The development
-LAN shortcut at port 8083 opens the same HTTPS page.
+`/assets/emulatorjs/input-netplay/admin.html` URL redirects here. The optional [dedicated Caddy listener](../deploy/caddy/README.md) serves the
+dashboard on HTTPS port 8083 and keeps the RomM login on port 8443.
 
-No extra admin port, account, OIDC provider, browser service token or CORS
-configuration is needed. Keep the ordinary RomM reverse-proxy route for `/api/`.
+The default RomM route needs no extra listener, account, OIDC provider, browser
+service token or CORS configuration. Keep the ordinary RomM reverse-proxy route for `/api/`.
 Do not send this URL directly to the public WebSocket transport upstream.
 Anonymous requests receive 401. Non-admin accounts receive 403, even if their
 token requests administrator scopes. Every UI asset, read and write is checked.
@@ -85,3 +85,26 @@ ROMM_SOURCE=/path/to/romm node test/admin-ui-smoke.mjs
 It checks login and role gates, CSRF forwarding, runtime/address updates,
 filtered logs, safe text, downloads, revoked access, both themes, mouse, touch,
 keyboard and narrow layouts. No emulator is launched. Image builds belong in CI.
+
+## Resource usage
+
+The Logs tab has three cards: bridge CPU, memory and network. Host CPU and memory
+are neither collected nor returned. Samples refresh every five seconds while the
+page is visible. CPU usage is normalized to the container quota (100% means its
+allocated capacity); memory shows current cgroup usage against its limit.
+
+Container cgroup metrics include WFC helper subprocesses. Both cgroup v2 and v1
+are supported. Without readable container metrics, CPU and memory are explicitly
+labelled as bridge process usage and RSS instead.
+
+Network metrics read container interface counters, excluding loopback, and show
+receive/send rates plus cumulative byte totals. They cover the bridge's HTTP,
+WebSocket and native TCP traffic as well as WFC gateway traffic. Totals reset when
+container interfaces are recreated. Rate calculations tolerate counter resets and
+interface changes. The deployment uses a private container network namespace;
+host networking is not qualified. Network usage is unavailable for a standalone
+process rather than substituting host-wide traffic. An unavailable counter or
+initial rate sample is not shown as zero usage.
+
+No Docker socket, privileged access, new port or extra agent is needed. These
+metrics use the same administrator-only overview endpoint as the settings.
