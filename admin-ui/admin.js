@@ -15,6 +15,7 @@ function denied(code) {
   clearInterval(timer);
   logs = [];
   cursor = 0;
+  renderResources(null);
   $("dashboard").hidden = true;
   $("access").hidden = false;
   $("access-title").textContent =
@@ -65,7 +66,62 @@ async function api(path = "", options = {}) {
         ? value.detail
         : `Request failed (${response.status})`,
     );
+  if (path === "/context") {
+    const applicationUrl = response.headers.get("X-Netplay-Application-URL");
+    if (applicationUrl) value.application_url = applicationUrl;
+  }
   return value;
+}
+function renderResources(value) {
+  const percentage = (number) =>
+    Number.isFinite(number) ? `${number.toFixed(1)}%` : "Collecting…";
+  const bytes = (number) => {
+    if (!Number.isFinite(number)) return "—";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const index =
+      number > 0
+        ? Math.min(
+            Math.max(0, Math.floor(Math.log(number) / Math.log(1024))),
+            units.length - 1,
+          )
+        : 0;
+    return `${(number / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
+  };
+  for (const id of ["service-cpu", "service-memory", "service-network"])
+    $(id).textContent = "—";
+  for (const id of [
+    "service-cpu-detail",
+    "service-memory-detail",
+    "service-network-detail",
+  ])
+    $(id).textContent = "";
+  $("resource-updated").textContent = value
+    ? `Sampled ${new Date(value.sampledAt).toLocaleTimeString()}`
+    : "Resource usage is unavailable on this bridge.";
+  if (!value) return;
+  const { service } = value;
+  const scope = service.scope === "container" ? "container" : "process";
+  $("service-cpu-label").textContent = `Bridge ${scope} CPU`;
+  $("service-memory-label").textContent = `Bridge ${scope} memory`;
+  $("service-cpu").textContent = percentage(service.cpuPercent);
+  $("service-cpu-detail").textContent = `${service.cores} CPU capacity`;
+  $("service-memory").textContent = bytes(service.usedBytes);
+  $("service-memory-detail").textContent = service.limitBytes
+    ? `${percentage(service.memoryPercent)} of ${bytes(service.limitBytes)} limit`
+    : "No container memory limit reported";
+  const network = service.network;
+  if (!network) {
+    $("service-network").textContent = "Unavailable";
+    $("service-network-detail").textContent =
+      "Container network statistics are unavailable.";
+    return;
+  }
+  const rate = (number) =>
+    Number.isFinite(number) ? `${bytes(number)}/s` : "Collecting…";
+  $("service-network").textContent =
+    `↓ ${rate(network.rxBytesPerSecond)}\n↑ ${rate(network.txBytesPerSecond)}`;
+  $("service-network-detail").textContent =
+    `Received ${bytes(network.rxBytes)} · Sent ${bytes(network.txBytes)}`;
 }
 function rows(id, values, text) {
   $(id).replaceChildren(
@@ -79,6 +135,7 @@ function rows(id, values, text) {
 async function load(initialize = false) {
   const value = await api();
   const { broker } = value;
+  renderResources(broker.resources);
   $("access").hidden = true;
   $("dashboard").hidden = false;
   $("account").textContent = `Administrator: ${value.username}`;
@@ -296,7 +353,9 @@ function selectTab(name, focus = false) {
   }
   if (focus) $(`${name}-tab`).focus();
   if (name === "logs")
-    void refreshLogs().catch((error) => status(error.message, true));
+    void Promise.all([load(), refreshLogs()]).catch((error) =>
+      status(error.message, true),
+    );
 }
 for (const name of ["settings", "logs"]) {
   $(`${name}-tab`).onclick = () => selectTab(name);
@@ -317,7 +376,9 @@ for (const name of ["settings", "logs"]) {
 }
 $("log-search").oninput = renderLogs;
 $("refresh-logs").onclick = () =>
-  void refreshLogs().catch((error) => status(error.message, true));
+  void Promise.all([load(), refreshLogs()]).catch((error) =>
+    status(error.message, true),
+  );
 $("download-logs").onclick = () => {
   const url = URL.createObjectURL(
     new Blob([logs.map((entry) => JSON.stringify(entry)).join("\n")], {

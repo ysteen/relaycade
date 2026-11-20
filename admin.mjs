@@ -1,3 +1,4 @@
+import { ResourceMonitor } from "./resources.mjs";
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -27,6 +28,7 @@ export class BridgeAdmin {
     this.events = [];
     this.sequence = 0;
     this.startedAt = Date.now();
+    this.resources = new ResourceMonitor();
     this.pending = Promise.resolve();
   }
 
@@ -139,6 +141,7 @@ export class BridgeAdmin {
       error: entry.error,
     }));
     return {
+      resources: this.resources.sample(),
       settings: this.settings,
       capacity: this.capacity,
       persistent: !!this.directory,

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Netplay Bridge administration</title>
+    <style>
+      body {
+        font: 16px/1.6 system-ui;
+        max-width: 42rem;
+        margin: 3rem auto;
+        padding: 0 1.5rem;
+      }
+      button { font: inherit; }
+      a { margin-inline-end: 1rem; }
+    </style>
+    <script src="/admin-access.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Netplay Bridge administration</h1>
+      <p id="access-message" role="status">Checking RomM administrator access…</p>
+      <a id="signin" href="/login" target="_blank" rel="noopener">Open RomM login</a>
+      <button id="check-access" type="button">Check access</button>
+    </main>
+  </body>
+</html>
