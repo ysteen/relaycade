@@ -17,6 +17,7 @@ const serviceToken = "test-ui-service-token-at-least-24-characters";
 const bridge = await createBridge({ adminToken: serviceToken, logger() {} });
 const bridgeBase = `http://127.0.0.1:${bridge.address.port}/v1/rooms/admin/ui/`;
 await mkdir(output, { recursive: true });
+let adminLanguage = "en";
 let role = "anonymous",
   failure = false,
   updates = 0;
@@ -87,13 +88,15 @@ const server = createServer(async (request, response) => {
         detail: "Administrator required",
       });
     const path = url.pathname.slice("/gateway/admin".length);
-    if (path === "/context")
+    if (path === "/context") {
+      response.setHeader("Content-Language", adminLanguage);
       return reply(200, {
         application_name: "Fixture library",
         application_url: "/library/",
         csrf_cookie: "fixture_csrf",
         csrf_header: "x-fixture-csrf",
       });
+    }
     if (["PUT", "POST"].includes(request.method)) {
       assert.equal(request.headers["x-fixture-csrf"], "fixture-csrf-value");
     }
@@ -349,6 +352,22 @@ try {
       assert.deepEqual(errors, []);
       await context.close();
     }
+    role = "admin";
+    adminLanguage = "ko";
+    const context = await browser.newContext({ locale: "en-US" });
+    const page = await context.newPage();
+    await page.goto(
+      `http://127.0.0.1:${server.address().port}/gateway/admin/ui/`,
+    );
+    await page.getByRole("heading", { name: "멀티플레이 관리" }).waitFor();
+    await page.getByRole("tab", { name: "로그" }).click();
+    await page.getByRole("heading", { name: "브리지 사용량" }).waitFor();
+    assert.equal(await page.locator("html").getAttribute("lang"), "ko");
+    await page
+      .locator("#service-network-detail")
+      .filter({ hasText: "수신" })
+      .waitFor();
+    await context.close();
   });
   console.log(
     "Admin UI passed: role gates, settings persistence requests, sync action, filtered logs, safe text, revoked access, themes, keyboard/mouse/touch and responsive layouts; no emulator launched",
